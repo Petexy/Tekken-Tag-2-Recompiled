@@ -12,6 +12,7 @@
 #include "gpu/backend.h"
 #include "gpu/gpu.h"
 #include "gpu/latte.h"
+#include "host/window.h"
 #include "os/kernel.h"
 
 #include "cafe/guest.h"
@@ -19,9 +20,12 @@
 
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 extern "C" uint64_t cafe_ppc_timebase(void);
 
@@ -41,6 +45,9 @@ std::condition_variable g_queue_cv;
 std::deque<Submission> g_queue;
 uint64_t g_submitted = 0; // under g_queue_mutex
 uint64_t g_retired = 0;   // under the kernel lock
+
+std::mutex g_written_mutex;
+std::vector<std::pair<uint32_t, uint32_t>> g_written; // CPU writes not yet seen by the backend
 
 std::once_flag g_started;
 std::unique_ptr<Backend> g_backend;
@@ -123,6 +130,18 @@ bool compare(uint32_t function, uint32_t value, uint32_t reference) {
 
 void execute(uint32_t address, uint32_t words, int depth);
 
+// Stream-out: a draw appends a vertex per index to each enabled buffer.
+void advance_stream_out(uint32_t vertices) {
+    if (!((*g_regs)[reg::VGT_STRMOUT_EN] & 1)) return;
+    const uint32_t enabled = (*g_regs)[reg::VGT_STRMOUT_BUFFER_EN];
+    for (uint32_t i = 0; i < 4; ++i) {
+        if (!(enabled & (1u << i))) continue;
+        const uint32_t stride = (*g_regs)[reg::VGT_STRMOUT_VTX_STRIDE_0 + i * 16];
+        const uint32_t offset_register = reg::VGT_STRMOUT_BUFFER_OFFSET_0 + i * 16;
+        set_register(offset_register, (*g_regs)[offset_register] + vertices * stride);
+    }
+}
+
 void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t header_address, int depth) {
     const auto arg = [&](uint32_t i) { return rd32(payload + i * 4); };
     switch (opcode) {
@@ -166,19 +185,25 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
     case pm4::kDrawIndexAuto: {
         // [count, draw initiator]
         const Draw draw{Draw::kAuto, arg(0), 0, (*g_regs)[reg::VGT_DMA_NUM_INSTANCES], (arg(1) & (1u << 6)) != 0};
+        dump_shaders(*g_regs);
         g_backend->draw(*g_regs, draw);
+        advance_stream_out(draw.count * std::max<uint32_t>(draw.num_instances, 1));
         break;
     }
     case pm4::kDrawIndex2: {
         // [max indices, address lo, address hi, count, draw initiator]
         const Draw draw{Draw::kIndexBuffer, arg(3), arg(1), (*g_regs)[reg::VGT_DMA_NUM_INSTANCES], false};
+        dump_shaders(*g_regs);
         g_backend->draw(*g_regs, draw);
+        advance_stream_out(draw.count * std::max<uint32_t>(draw.num_instances, 1));
         break;
     }
     case pm4::kDrawIndexImmd: {
         // [count, draw initiator, indices...]
         const Draw draw{Draw::kImmediate, arg(0), payload + 8, (*g_regs)[reg::VGT_DMA_NUM_INSTANCES], false};
+        dump_shaders(*g_regs);
         g_backend->draw(*g_regs, draw);
+        advance_stream_out(draw.count * std::max<uint32_t>(draw.num_instances, 1));
         break;
     }
 
@@ -191,6 +216,8 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
         break;
     case pm4::kEventWriteEop: {
         // [event initiator, address lo, address hi (data/interrupt select), data lo, data hi]
+        // Written once everything before it has finished.
+        g_backend->sync();
         const uint32_t target = arg(1) & ~3u;
         switch (arg(2) >> 29) {
         case 1: wr32(target, arg(3)); break;
@@ -341,7 +368,16 @@ void command_processor_main() {
             s = g_queue.front();
             g_queue.pop_front();
         }
+        {
+            std::vector<std::pair<uint32_t, uint32_t>> written;
+            {
+                std::lock_guard lock(g_written_mutex);
+                written.swap(g_written);
+            }
+            for (const auto& [address, size] : written) g_backend->cpu_wrote(address, size);
+        }
         execute(s.buffer, s.words, 0);
+        g_backend->sync();
         retire(s.timestamp);
     }
 }
@@ -353,7 +389,10 @@ void start_display();
 void start() {
     std::call_once(g_started, [] {
         g_regs = new Registers{};
-        g_backend = make_null_backend();
+        // TTT2_GPU=null renders nothing (headless); otherwise Vulkan in the window.
+        const char* choice = std::getenv("TTT2_GPU");
+        if (host::window_open() && !(choice && std::strcmp(choice, "null") == 0)) g_backend = make_vulkan_backend();
+        else g_backend = make_null_backend();
         std::fprintf(stderr, "ttt2: GPU backend: %s\n", g_backend->name());
         std::thread(command_processor_main).detach();
         start_display();
@@ -384,5 +423,11 @@ bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns) {
 }
 
 uint64_t clock() { return cafe_ppc_timebase(); }
+
+void cpu_wrote(uint32_t address, uint32_t size) {
+    if (size == 0) return;
+    std::lock_guard lock(g_written_mutex);
+    g_written.emplace_back(address, size);
+}
 
 } // namespace cafe::gpu

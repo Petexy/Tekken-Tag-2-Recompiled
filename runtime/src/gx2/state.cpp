@@ -180,7 +180,10 @@ void set_default_state() {
 }
 
 void invalidate_caches(uint32_t mode, uint32_t address, uint32_t size) {
-    if (mode == 0 || mode == invalidate::kCpu) return; // CPU caches are coherent here
+    // CPU caches are coherent here, but the renderer keeps GPU copies of what
+    // the CPU wrote (textures, shaders).
+    if (mode & invalidate::kCpu) gpu::cpu_wrote(address, size);
+    if (mode == 0 || mode == invalidate::kCpu) return;
     if (size != 0xFFFFFFFF) size = (size + 0xFF) & ~0xFFu;
     uint32_t control = 1u << 31; // ENGINE_ME
     if (address == 0 && size == 0xFFFFFFFF && (mode & 0xF)) control |= 1u << 20;               // FULL_CACHE

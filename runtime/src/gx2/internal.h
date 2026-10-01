@@ -96,6 +96,8 @@ struct SurfaceInfo {
     uint32_t bpp;         // bits per element
 };
 SurfaceInfo surface_info(const Surface& surface, uint32_t level);
+// AddrLib's handle (ADDR_HANDLE), configured as the console's GPU.
+void* address_library();
 void calc_surface_size_and_alignment(Surface& surface);
 void init_color_buffer_regs(ColorBuffer& buffer);
 

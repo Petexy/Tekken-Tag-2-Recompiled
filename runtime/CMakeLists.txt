@@ -33,6 +33,16 @@ add_library(cafe_runtime OBJECT
     src/gpu/command_processor.cpp
     src/gpu/display.cpp
     src/gpu/null_backend.cpp
+    src/gpu/shader_dump.cpp
+    src/gpu/tiling.cpp
+    src/gpu/vulkan/context.cpp
+    src/gpu/vulkan/draw.cpp
+    src/gpu/vulkan/formats.cpp
+    src/gpu/vulkan/png.cpp
+    src/gpu/vulkan/renderer.cpp
+    src/gpu/vulkan/targets.cpp
+    src/gpu/vulkan/textures.cpp
+    src/host/window.cpp
     src/gx2/cbpool.cpp
     src/gx2/display.cpp
     src/gx2/draw.cpp
@@ -45,5 +55,26 @@ add_library(cafe_runtime OBJECT
     src/gx2/texture.cpp)
 target_include_directories(cafe_runtime PUBLIC include PRIVATE src)
 target_compile_features(cafe_runtime PUBLIC cxx_std_20)
-target_link_libraries(cafe_runtime PUBLIC cafe_rpx OpenSSL::Crypto ZArchive::zarchive amd_addrlib)
-target_compile_options(cafe_runtime PRIVATE -Wall -Wextra -Wpedantic)
+find_package(Vulkan REQUIRED)
+find_package(SDL3 REQUIRED CONFIG)
+# GLSL -> SPIR-V at run time.
+find_library(SHADERC_LIBRARY NAMES shaderc_shared REQUIRED)
+target_link_libraries(cafe_runtime PUBLIC cafe_rpx OpenSSL::Crypto ZArchive::zarchive amd_addrlib cafe_latte
+    Vulkan::Vulkan SDL3::SDL3 ${SHADERC_LIBRARY})
+# Vulkan structures are initialised with only their sType.
+target_compile_options(cafe_runtime PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+
+# Latte shader decoding and translation, shared by the runtime and tools.
+add_library(cafe_latte STATIC
+    src/latte/isa.cpp
+    src/latte/decode.cpp
+    src/latte/disassemble.cpp
+    src/latte/environment.cpp
+    src/latte/translate.cpp)
+target_include_directories(cafe_latte PUBLIC src)
+target_compile_features(cafe_latte PUBLIC cxx_std_20)
+target_compile_options(cafe_latte PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(cafe-shader src/latte/cafe_shader_main.cpp)
+target_link_libraries(cafe-shader PRIVATE cafe_latte ${SHADERC_LIBRARY})
+target_compile_options(cafe-shader PRIVATE -Wall -Wextra -Wpedantic)

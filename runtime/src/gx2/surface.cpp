@@ -7,6 +7,9 @@
 
 #include "gx2/internal.h"
 
+#include "gpu/gpu.h"
+#include "gpu/tiling.h"
+
 #include "cafe/export.h"
 #include "cafe/runtime.h"
 
@@ -14,6 +17,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -60,6 +64,8 @@ uint32_t max_levels(const Surface& s) {
 }
 
 } // namespace
+
+void* address_library() { return addrlib(); }
 
 SurfaceInfo surface_info(const Surface& s, uint32_t level) {
     const uint32_t format = s.format;
@@ -417,6 +423,18 @@ void GX2CopySurface(Surface* src, uint32_t src_level, uint32_t src_slice, Surfac
                     uint32_t dst_slice) {
     if (src->format == 0u || src->width == 0u || src->height == 0u || dst->format == 0u) return;
     ApiLock lock;
+    // With an unaligned linear surface on either side the console's GX2
+    // copies on the CPU, at once: titles reuse the source straight away.
+    if (src->tile_mode == uint32_t{kTileLinearSpecial} || dst->tile_mode == uint32_t{kTileLinearSpecial}) {
+        uint32_t address = 0, size = 0;
+        if (gpu::copy_surface_memory(*src, src_level, src_slice, *dst, dst_level, dst_slice, address, size)) {
+            gpu::cpu_wrote(address, size);
+        } else {
+            std::fprintf(stderr, "ttt2: GX2CopySurface: format 0x%X -> 0x%X not supported\n", uint32_t{src->format},
+                         uint32_t{dst->format});
+        }
+        return;
+    }
     HlePacket(pm4::kHleCopySurface)
         .guest_struct(*src).u32(src_level).u32(src_slice)
         .guest_struct(*dst).u32(dst_level).u32(dst_slice)

@@ -46,11 +46,22 @@ public:
     virtual void copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan_target) = 0;
     // The frame is complete; the display shows it at the next flip.
     virtual void swap() = 0;
-    // Guest memory in [address, address + size) was written by the CPU (or
-    // must be written back for the CPU).
+    // SURFACE_SYNC: GPU caches over [address, address + size) are flushed or
+    // invalidated (CP_COHER_CNTL bits in `coherency_flags`).
     virtual void invalidate(uint32_t address, uint32_t size, uint32_t coherency_flags) = 0;
+    // The CPU (or the DMA engine) wrote guest memory in [address, address + size).
+    virtual void cpu_wrote(uint32_t, uint32_t) {}
+    // Everything requested so far has finished on the GPU: called before the
+    // command processor makes the CPU see that it has (retired timestamps,
+    // end-of-pipe writes).
+    virtual void sync() {}
 };
 
 std::unique_ptr<Backend> make_null_backend();
+// The Vulkan renderer, presenting in the window (host/window.h).
+std::unique_ptr<Backend> make_vulkan_backend();
+
+// TTT2_DUMP_SHADERS support (shader_dump.cpp): records the shaders of a draw.
+void dump_shaders(const Registers& regs);
 
 } // namespace cafe::gpu

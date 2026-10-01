@@ -7,8 +7,12 @@
 #include "cafe/export.h"
 #include "cafe/input.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace cafe::os {
 namespace {
@@ -16,6 +20,51 @@ namespace {
 std::mutex g_input_mutex;
 GamepadState g_gamepad{};
 uint32_t g_previous_hold = 0;
+
+// TTT2_INPUT_SCRIPT="15:plus,20.5:a,22:down" presses each button for a
+// fifth of a second at the given second after start-up, for unattended runs.
+struct ScriptedPress {
+    double at;
+    uint32_t button;
+};
+
+std::vector<ScriptedPress> load_script() {
+    std::vector<ScriptedPress> presses;
+    const char* script = std::getenv("TTT2_INPUT_SCRIPT");
+    if (script == nullptr) return presses;
+    static const std::pair<const char*, uint32_t> kNames[] = {
+        {"a", vpad::kA}, {"b", vpad::kB}, {"x", vpad::kX}, {"y", vpad::kY}, {"left", vpad::kLeft},
+        {"right", vpad::kRight}, {"up", vpad::kUp}, {"down", vpad::kDown}, {"zl", vpad::kZL}, {"zr", vpad::kZR},
+        {"l", vpad::kL}, {"r", vpad::kR}, {"plus", vpad::kPlus}, {"minus", vpad::kMinus}, {"home", vpad::kHome},
+    };
+    std::string text(script);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t end = text.find(',', pos) == std::string::npos ? text.size() : text.find(',', pos);
+        const std::string item = text.substr(pos, end - pos);
+        const size_t colon = item.find(':');
+        if (colon != std::string::npos) {
+            const std::string name = item.substr(colon + 1);
+            for (const auto& [n, bit] : kNames) {
+                if (name == n) presses.push_back({std::atof(item.substr(0, colon).c_str()), bit});
+            }
+        }
+        pos = end + 1;
+    }
+    return presses;
+}
+
+uint32_t scripted_buttons() {
+    static const std::vector<ScriptedPress> script = load_script();
+    static const auto start = std::chrono::steady_clock::now();
+    if (script.empty()) return 0;
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    uint32_t buttons = 0;
+    for (const ScriptedPress& p : script) {
+        if (t >= p.at && t < p.at + 0.2) buttons |= p.button;
+    }
+    return buttons;
+}
 
 // ------------------------------------------------------------------- vpad
 constexpr int32_t kVpadOk = 0;
@@ -53,7 +102,7 @@ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t
     }
     std::lock_guard lock(g_input_mutex);
     std::memset(status, 0, sizeof(VPADStatus));
-    const uint32_t hold = g_gamepad.buttons;
+    const uint32_t hold = g_gamepad.buttons | scripted_buttons();
     status->hold = hold;
     status->trigger = hold & ~g_previous_hold;
     status->release = g_previous_hold & ~hold;

@@ -26,6 +26,11 @@ uint64_t retired_timestamp();
 // false if `timeout_ns` passed first.
 bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns);
 
+// The CPU wrote guest memory the GPU may hold a copy of (textures, shaders):
+// GX2Invalidate with the CPU flag and DMA engine transfers. Takes effect
+// before the next submission executes. Any thread.
+void cpu_wrote(uint32_t address, uint32_t size);
+
 // The clock the command processor samples for GPU timestamps, in CPU timer
 // ticks (so GX2GPUTimeToCPUTime is the identity).
 uint64_t clock();

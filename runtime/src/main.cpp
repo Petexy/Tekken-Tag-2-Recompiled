@@ -5,12 +5,15 @@
 #include "cafe/sysmem.h"
 #include "cafe/vfs.h"
 
-#include <cstdlib>
+#include "host/window.h"
 
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 
 namespace cafe::os {
 void init_heaps(uint32_t mem2_begin);
@@ -81,6 +84,21 @@ int main(int argc, char** argv) {
     // argv[0] is the executable name, as the Cafe loader passes it.
     const uint32_t guest_argv = system_alloc(8);
     *reinterpret_cast<uint32_t*>(guest_pointer(guest_argv)) = __builtin_bswap32(guest_strdup("Tekken.rpx"));
-    return os::run_main_thread(image.entry_point, 1, guest_argv, image.stack_size, image.sda_base,
-                               image.sda2_base);
+    const auto run = [&] {
+        return os::run_main_thread(image.entry_point, 1, guest_argv, image.stack_size, image.sda_base,
+                                   image.sda2_base);
+    };
+    // The window's event loop needs the process's main thread; the title
+    // runs beside it. TTT2_GPU=null runs headless.
+    const char* gpu = std::getenv("TTT2_GPU");
+    if ((gpu && std::strcmp(gpu, "null") == 0) || !host::open_window("Tekken Tag Tournament 2")) return run();
+    std::atomic<bool> finished{false};
+    int result = 0;
+    std::thread title([&] {
+        result = run();
+        finished = true;
+    });
+    if (!host::run_event_loop([&] { return finished.load(); })) std::_Exit(0); // window closed
+    title.join();
+    return result;
 }

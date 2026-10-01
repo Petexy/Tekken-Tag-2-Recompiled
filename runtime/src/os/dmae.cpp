@@ -7,6 +7,8 @@
 
 #include "kernel.h"
 
+#include "gpu/gpu.h"
+
 #include "cafe/export.h"
 
 #include <atomic>
@@ -60,6 +62,7 @@ uint64_t DMAECopyMem(GuestAddress dst, GuestAddress src, uint32_t words, uint32_
         std::memmove(out, in, bytes);
         break;
     }
+    gpu::cpu_wrote(dst.value, static_cast<uint32_t>(bytes));
     return complete();
 }
 
@@ -67,6 +70,7 @@ uint64_t DMAECopyMem(GuestAddress dst, GuestAddress src, uint32_t words, uint32_
 uint64_t DMAEFillMem(GuestAddress dst, uint32_t value, uint32_t words) {
     be<uint32_t>* out = dst.as<be<uint32_t>>();
     for (uint32_t i = 0; i < words; ++i) out[i] = value;
+    gpu::cpu_wrote(dst.value, words * 4);
     return complete();
 }
 

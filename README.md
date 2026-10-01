@@ -1,8 +1,9 @@
 # Tekken Tag Tournament 2 Wii U → x86-64
 
-This workspace starts a **static recompilation** project for the user's European
+This workspace is a **static recompilation** project for the user's European
 Wii U dump. The target is a native x86-64 program; generated C/C++ is acceptable.
-**There is no working native Tekken executable yet.**
+The native executable boots, renders the intro, title screen, menus and
+attract-mode fights in a window; sound and gameplay are not done yet.
 
 ## Verified input
 
@@ -37,13 +38,19 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
 
 ## Current results
 
-- **The game runs natively into its main loop**, reading `Tekken.rpx` and
-  assets straight from the `.wua`: a steady 59.9 frames/s (vsync-paced),
-  10-15 draws per frame, with no window yet (the GPU backend renders
-  nothing). Every function the game imports statically is implemented.
+- **The game renders natively in a window**: the intro movie, logos,
+  title screen, attract-mode demo fights (stages, characters, effects,
+  subtitles), the main menu and character select, at ~58 frames/s on an
+  RX 9060 XT, reading `Tekken.rpx` and assets straight from the `.wua`.
+  Every function the game imports statically is implemented.
   `cafe-recomp` turns the reachable 79,564 functions (6.03M instructions)
   into 257 C++ files in ~2 s; clang builds them with the runtime into a
   132 MB x86-64 `ttt2` in ~4 minutes.
+- The renderer (`runtime/src/gpu/vulkan/`) translates the game's Latte
+  shaders to GLSL/SPIR-V (`runtime/src/latte/`), reads vertex and uniform
+  data from guest memory in place, detiles textures with AMD's address
+  library and presents through SDL3. See
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#vulkan-renderer).
 - The native Cafe OS layer (`runtime/src/os/`) covers threads and
   synchronisation, heaps, filesystem and saves, system services, ProcUI,
   input, the AX voice model and final-mix stage (no sound output yet), DMA,
@@ -60,8 +67,9 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
 - `cafe-census` facts (205,140 functions from the symbol table, 0 undecodable
   words, 20.3% reachable) are in
   [`analysis/instruction-census.txt`](analysis/instruction-census.txt).
-- Not done: rendering (Vulkan backend, Latte shader translation), sound
-  output, input from host devices, gameplay.
+- Not done: sound output, confirming character selection with input (the
+  menus navigate), gameplay, MSAA, a first-boot black screen of ~16 s
+  (not yet checked against the console).
 
 Earlier evaluation of existing recompilers is in
 [`analysis/recompiler-assessment.md`](analysis/recompiler-assessment.md).
@@ -151,6 +159,11 @@ cmake --build build-port --target ttt2 -j 8
 build-port/ttt2 "/path/to/TEKKEN TAG 2 Wii U EDITION (EU).wua"
 ```
 
+The renderer needs Vulkan 1.3 with VK_EXT_external_memory_host and push
+descriptors (any current AMD, NVIDIA or Intel driver on Linux), SDL3 and
+shaderc. Controls and debugging variables are listed in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#running-the-port).
+
 The semantics test needs the Dolphin reference checkout in
 `third_party/ref/dolphin` and `fmt`:
 `cmake --build build --target semantics_test && build/tests/semantics_test`.
@@ -159,8 +172,8 @@ The semantics test needs the Dolphin reference checkout in
 ## Next engineering milestones
 
 See the milestone table in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-Next: M3, a Vulkan backend for the command processor (render targets,
-textures with detiling, Latte shader to SPIR-V translation) and a window.
+Next: M4, input (character select does not confirm yet), audio output
+through SDL3, saves; then M5, an offline match.
 
 ## Local data and checks
 

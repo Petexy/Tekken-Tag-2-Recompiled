@@ -1,0 +1,314 @@
+// Render targets: color and depth buffers as GPU images, found by the
+// address, format and size the registers (or the GX2 structures of the HLE
+// packets) give. Clears and surface copies work on them.
+
+#include "gpu/vulkan/renderer.h"
+
+#include "gpu/latte.h"
+#include "gpu/tiling.h"
+#include "gx2/internal.h"
+
+#include "cafe/runtime.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace cafe::gpu::vk {
+namespace {
+
+using namespace latte;
+
+// Address of the level a color/depth buffer view renders to, swizzle
+// included, as GX2SetColorBuffer/GX2SetDepthBuffer program it.
+uint32_t view_address(const gx2::Surface& s, uint32_t view_mip) {
+    uint32_t address = s.image;
+    if (view_mip != 0) {
+        address = s.mipmaps;
+        if (view_mip > 1) address += s.mip_level_offset[view_mip - 1];
+    }
+    if (gx2::is_macro_tiled(s.tile_mode) && view_mip < ((s.swizzle >> 16) & 0xFF)) address ^= s.swizzle & 0xFFFF;
+    return address;
+}
+
+// Macro-tiled surfaces carry the bank/pipe swizzle in address bits 8-10.
+uint32_t strip_swizzle(uint32_t address, uint32_t tile_mode) {
+    return gx2::is_macro_tiled(tile_mode) ? address & ~0x700u : address;
+}
+
+} // namespace
+
+Target* Renderer::find_target(uint32_t address, uint32_t format, bool depth) {
+    Target* best = nullptr;
+    for (auto& t : targets_) {
+        if (t->address != address || t->depth != depth) continue;
+        if (format != 0 && (t->format & 0x3F) != (format & 0x3F)) continue;
+        if (best == nullptr || t->written > best->written) best = t.get();
+    }
+    return best;
+}
+
+Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t info_reg) {
+    const uint32_t tile_mode = (info_reg >> 8) & 0xF;
+    const uint32_t address = strip_swizzle(base_reg << 8, tile_mode);
+    const uint32_t format = color_buffer_surface_format(info_reg);
+    const uint32_t pitch = ((size_reg & 0x3FF) + 1) * 8;
+    const uint32_t height = (((size_reg >> 10) & 0xFFFFF) + 1) * 64 / pitch;
+    for (auto& t : targets_) {
+        if (!t->depth && t->address == address && t->format == format && t->pitch == pitch && t->height == height) {
+            return t.get();
+        }
+    }
+    const FormatInfo f = color_format(format);
+    if (f.format == VK_FORMAT_UNDEFINED || f.compressed) {
+        static uint32_t reported = 0;
+        if (reported != format) std::fprintf(stderr, "ttt2: gpu: unsupported color buffer format 0x%03X\n", format);
+        reported = format;
+        return nullptr;
+    }
+    auto t = std::make_unique<Target>();
+    t->address = address;
+    t->format = format;
+    t->pitch = pitch;
+    t->height = height;
+    t->tile_mode = tile_mode;
+    t->image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, pitch, height, 1, 1,
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_VIEW_TYPE_2D);
+    t->written = stamp();
+    if (std::getenv("TTT2_TRACE_TARGETS")) {
+        std::fprintf(stderr, "ttt2: gpu: new color target 0x%08X fmt 0x%03X %ux%u tile %u (size 0x%08X info 0x%08X)\n",
+                     address, format, pitch, height, tile_mode, size_reg, info_reg);
+    }
+    targets_.push_back(std::move(t));
+    return targets_.back().get();
+}
+
+Target* Renderer::color_target(const gx2::ColorBuffer& buffer) {
+    return color_target(view_address(buffer.surface, buffer.view_mip) >> 8, buffer.cb_color_size, buffer.cb_color_info);
+}
+
+Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t info_reg) {
+    const uint32_t tile_mode = (info_reg >> 15) & 0xF;
+    const uint32_t address = strip_swizzle(base_reg << 8, tile_mode);
+    const uint32_t format = depth_buffer_surface_format(info_reg);
+    const uint32_t pitch = ((size_reg & 0x3FF) + 1) * 8;
+    const uint32_t height = (((size_reg >> 10) & 0xFFFFF) + 1) * 64 / pitch;
+    for (auto& t : targets_) {
+        if (t->depth && t->address == address && t->format == format && t->pitch == pitch && t->height == height) {
+            return t.get();
+        }
+    }
+    const FormatInfo f = depth_format(format);
+    if (f.format == VK_FORMAT_UNDEFINED) {
+        std::fprintf(stderr, "ttt2: gpu: unsupported depth buffer format 0x%03X\n", format);
+        return nullptr;
+    }
+    auto t = std::make_unique<Target>();
+    t->address = address;
+    t->format = format;
+    t->pitch = pitch;
+    t->height = height;
+    t->tile_mode = tile_mode;
+    t->depth = true;
+    if (std::getenv("TTT2_TRACE_TARGETS")) {
+        std::fprintf(stderr, "ttt2: gpu: new depth target 0x%08X fmt 0x%03X %ux%u tile %u (size 0x%08X info 0x%08X)\n",
+                     address, format, pitch, height, tile_mode, size_reg, info_reg);
+    }
+    t->image = create_image(f.format, f.aspect, pitch, height, 1, 1,
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_VIEW_TYPE_2D);
+    t->written = stamp();
+    targets_.push_back(std::move(t));
+    return targets_.back().get();
+}
+
+Target* Renderer::depth_target(const gx2::DepthBuffer& buffer) {
+    return depth_target(view_address(buffer.surface, buffer.view_mip) >> 8, buffer.db_depth_size,
+                        buffer.db_depth_info);
+}
+
+// ----------------------------------------------------------------- clears
+
+void Renderer::clear_color(const Registers&, const gx2::ColorBuffer& buffer, const float rgba[4]) {
+    Target* t = color_target(buffer);
+    if (t == nullptr) return;
+    end_rendering();
+    barrier();
+    VkClearColorValue value{};
+    const uint32_t type = (t->format >> 8) & 0xF;
+    for (int i = 0; i < 4; ++i) {
+        if (type == gx2::surface_format::kTypeUint) value.uint32[i] = static_cast<uint32_t>(rgba[i]);
+        else if (type == gx2::surface_format::kTypeSint) value.int32[i] = static_cast<int32_t>(rgba[i]);
+        else value.float32[i] = rgba[i];
+    }
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+    barrier();
+    t->written = stamp();
+    if (tracing()) {
+        std::fprintf(stderr, "trace: clear color 0x%08X fmt 0x%03X %ux%u (%g %g %g %g)\n", t->address, t->format,
+                     t->pitch, t->height, rgba[0], rgba[1], rgba[2], rgba[3]);
+    }
+}
+
+void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buffer, uint32_t flags, float depth,
+                                   uint32_t stencil) {
+    Target* t = depth_target(buffer);
+    if (t == nullptr) return;
+    VkImageAspectFlags aspect = 0;
+    if (flags & 1) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT; // GX2_CLEAR_FLAGS_DEPTH
+    if (flags & 2) aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    aspect &= t->image.aspect;
+    if (aspect == 0) return;
+    end_rendering();
+    barrier();
+    VkClearDepthStencilValue value{std::clamp(depth, 0.0f, 1.0f), stencil & 0xFF};
+    VkImageSubresourceRange range{aspect, 0, 1, 0, 1};
+    vkCmdClearDepthStencilImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+    barrier();
+    t->written = stamp();
+    if (tracing()) {
+        std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
+                     t->pitch, t->height, flags, depth, stencil);
+    }
+}
+
+// ----------------------------------------------------------------- copies
+
+void Renderer::copy_target_region(const Target& src, const Image& dst, uint32_t dst_layer, uint32_t width,
+                                  uint32_t height) {
+    end_rendering();
+    barrier();
+    VkImageCopy region{};
+    region.srcSubresource = {src.image.aspect, 0, 0, 1};
+    region.dstSubresource = {dst.aspect & src.image.aspect, 0, dst_layer, 1};
+    region.srcSubresource.aspectMask = region.dstSubresource.aspectMask;
+    region.extent = {std::min({width, src.image.width, dst.width}), std::min({height, src.image.height, dst.height}), 1};
+    vkCmdCopyImage(cmd(), src.image.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    barrier();
+}
+
+namespace {
+
+// The registers a color buffer over level `level` of `s` would have.
+void surface_level_registers(const gx2::Surface& s, uint32_t level, uint32_t& base, uint32_t& size, uint32_t& info) {
+    const gx2::SurfaceInfo li = gx2::surface_info(s, level);
+    base = view_address(s, level) >> 8;
+    size = field(li.pitch / 8 - 1, 0, 10) | field(li.pitch * li.height / 64 - 1, 10, 20);
+    // CB_COLOR_INFO's FORMAT, ARRAY_MODE and NUMBER_TYPE, which is all
+    // color_target() reads.
+    const uint32_t type = gx2::surface_format::type(s.format);
+    uint32_t number = 0;
+    switch (type) {
+    case gx2::surface_format::kTypeSnorm: number = 1; break;
+    case gx2::surface_format::kTypeUint: number = 4; break;
+    case gx2::surface_format::kTypeSint: number = 5; break;
+    case gx2::surface_format::kTypeSrgb: number = 6; break;
+    case gx2::surface_format::kTypeFloat: number = 7; break;
+    default: break;
+    }
+    info = field(s.format & 0x3F, 2, 6) | field(li.tile_mode, 8, 4) | field(number, 12, 3);
+}
+
+// DB_FORMAT for a GX2 depth surface format.
+uint32_t db_format_of(uint32_t format) {
+    switch (format) {
+    case gx2::surface_format::kUnormR16: return 1;
+    case gx2::surface_format::kFloatR32: return 6;
+    case gx2::surface_format::kFloatD24S8: return 5;
+    case gx2::surface_format::kFloatX8X24: return 7;
+    default: return 3; // DEPTH_8_24
+    }
+}
+
+} // namespace
+
+void Renderer::copy_surface(const gx2::Surface& src, uint32_t src_level, uint32_t src_slice, const gx2::Surface& dst,
+                            uint32_t dst_level, uint32_t dst_slice) {
+    if (tracing() || std::getenv("TTT2_TRACE_COPIES")) {
+        std::fprintf(stderr, "copy: src img 0x%08X mip 0x%08X dim %u %ux%ux%u levels %u fmt 0x%03X tile %u swz 0x%08X pitch %u use 0x%X | lvl %u slice %u\n",
+                     uint32_t{src.image}, uint32_t{src.mipmaps}, uint32_t{src.dim}, uint32_t{src.width}, uint32_t{src.height},
+                     uint32_t{src.depth}, uint32_t{src.mip_levels}, uint32_t{src.format}, uint32_t{src.tile_mode},
+                     uint32_t{src.swizzle}, uint32_t{src.pitch}, uint32_t{src.use}, src_level, src_slice);
+        std::fprintf(stderr, "copy: dst img 0x%08X mip 0x%08X dim %u %ux%ux%u levels %u fmt 0x%03X tile %u swz 0x%08X pitch %u use 0x%X | lvl %u slice %u\n",
+                     uint32_t{dst.image}, uint32_t{dst.mipmaps}, uint32_t{dst.dim}, uint32_t{dst.width}, uint32_t{dst.height},
+                     uint32_t{dst.depth}, uint32_t{dst.mip_levels}, uint32_t{dst.format}, uint32_t{dst.tile_mode},
+                     uint32_t{dst.swizzle}, uint32_t{dst.pitch}, uint32_t{dst.use}, dst_level, dst_slice);
+    }
+    if (tracing()) {
+        std::fprintf(stderr, "trace: copy surface 0x%08X fmt 0x%03X %ux%u tile %u level %u slice %u -> 0x%08X fmt 0x%03X %ux%u tile %u level %u slice %u\n",
+                     uint32_t{src.image}, uint32_t{src.format}, uint32_t{src.width}, uint32_t{src.height},
+                     uint32_t{src.tile_mode}, src_level, src_slice, uint32_t{dst.image}, uint32_t{dst.format},
+                     uint32_t{dst.width}, uint32_t{dst.height}, uint32_t{dst.tile_mode}, dst_level, dst_slice);
+    }
+    uint32_t sb, ss, si, db, ds, di;
+    surface_level_registers(src, src_level, sb, ss, si);
+    surface_level_registers(dst, dst_level, db, ds, di);
+    const bool src_depth = (src.use & gx2::surface_use::kDepthBuffer) != 0;
+    Target* from = find_target(strip_swizzle(sb << 8, (si >> 8) & 0xF), src.format, src_depth);
+    if (from == nullptr) {
+        // Only in guest memory: copy the elements, retiling.
+        uint32_t address = 0, bytes = 0;
+        if (!copy_surface_memory(src, src_level, src_slice, dst, dst_level, dst_slice, address, bytes)) {
+            std::fprintf(stderr, "ttt2: gpu: GX2CopySurface fmt 0x%X -> 0x%X not supported\n", uint32_t{src.format},
+                         uint32_t{dst.format});
+            return;
+        }
+        cpu_wrote(address, bytes);
+        return;
+    }
+    if (src_slice != 0 || dst_slice != 0) {
+        std::fprintf(stderr, "ttt2: gpu: GX2CopySurface between render target slices %u -> %u not supported\n",
+                     src_slice, dst_slice);
+        return;
+    }
+    if (src_depth) {
+        Target* to = depth_target(db, ds, db_format_of(dst.format) | field(gx2::surface_info(dst, dst_level).tile_mode, 15, 4));
+        if (to == nullptr) return;
+        copy_target_region(*from, to->image, 0, from->pitch, from->height);
+        to->written = stamp();
+        return;
+    }
+    Target* to = color_target(db, ds, di);
+    if (to == nullptr) return;
+    copy_target_region(*from, to->image, 0, std::max(1u, src.width >> src_level), std::max(1u, src.height >> src_level));
+    to->written = stamp();
+}
+
+void Renderer::resolve_color(const gx2::ColorBuffer& src, const gx2::Surface& dst, uint32_t dst_level, uint32_t dst_slice) {
+    if (tracing()) std::fprintf(stderr, "trace: resolve 0x%08X -> 0x%08X\n", uint32_t{src.surface.image}, uint32_t{dst.image});
+    // Render targets are single-sampled here: a resolve is a copy.
+    Target* from = color_target(src);
+    if (from == nullptr) return;
+    uint32_t db, ds, di;
+    surface_level_registers(dst, dst_level, db, ds, di);
+    if (dst_slice != 0) std::fprintf(stderr, "ttt2: gpu: resolve to slice %u not supported\n", dst_slice);
+    Target* to = color_target(db, ds, di);
+    if (to == nullptr) return;
+    copy_target_region(*from, to->image, 0, src.surface.width, src.surface.height);
+    to->written = stamp();
+}
+
+void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& dst, uint32_t dst_level,
+                             uint32_t dst_slice) {
+    if (tracing()) std::fprintf(stderr, "trace: convert depth 0x%08X -> 0x%08X fmt 0x%03X\n", uint32_t{src.surface.image}, uint32_t{dst.image}, uint32_t{dst.format});
+    // The depth values become a texture the title samples; keep them as a
+    // depth image at the destination address.
+    Target* from = depth_target(src);
+    if (from == nullptr) return;
+    const gx2::SurfaceInfo li = gx2::surface_info(dst, dst_level);
+    const uint32_t base = view_address(dst, dst_level) >> 8;
+    const uint32_t size = field(li.pitch / 8 - 1, 0, 10) | field(li.pitch * li.height / 64 - 1, 10, 20);
+    const uint32_t db_format = db_format_of(dst.format);
+    if (dst_slice != 0) std::fprintf(stderr, "ttt2: gpu: depth conversion to slice %u not supported\n", dst_slice);
+    Target* to = depth_target(base, size, db_format | field(li.tile_mode, 15, 4));
+    if (to == nullptr) return;
+    copy_target_region(*from, to->image, 0, src.surface.width, src.surface.height);
+    to->written = stamp();
+}
+
+} // namespace cafe::gpu::vk

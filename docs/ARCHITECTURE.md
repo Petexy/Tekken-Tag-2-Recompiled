@@ -70,8 +70,9 @@ Implemented in host C++, no guest-code interpretation:
    under `~/.local/share/ttt2/`.
 2. **gx2 → GPU** (see below): GX2 implemented natively, writing PM4 command
    buffers that a command processor executes against a Latte register file
-   and hands to a rendering backend (null today, Vulkan next). Latte shaders
-   the game ships will be translated to SPIR-V; tiled surfaces detiled.
+   and hands to a rendering backend: Vulkan, or null for headless runs.
+   Latte shaders the game ships are translated to GLSL and compiled to
+   SPIR-V at run time; tiled surfaces are detiled.
 3. **snd_core / snd_user → host audio** (SDL3).
 4. **vpad / padscore → SDL3 gamepad**.
 5. **nsysnet / nlibcurl / nn_\***: offline stubs.
@@ -92,7 +93,7 @@ GX2 (runtime/src/gx2/) ──PM4──► command buffers in guest memory
                                      │ GX2Flush / display lists
                                      ▼
 command processor thread (runtime/src/gpu/) ── Latte register file
-   draws, clears, copies, swaps ──► Backend (null; Vulkan in M3)
+   draws, clears, copies, swaps ──► Backend (Vulkan; null when headless)
    timestamps, GPU-written memory, swap/flip counts ──► guest
 ```
 
@@ -115,10 +116,68 @@ command processor thread (runtime/src/gpu/) ── Latte register file
   format whether GX2 or the title produced them.
 - The display flips frames at 59.94 Hz, honouring the swap interval;
   GX2GetSwapStatus reports what the title paces its loop on.
+- GX2CopySurface with an unaligned linear (LINEAR_SPECIAL) surface on
+  either side is a synchronous CPU copy, as on the console: the title
+  copies each texture out of one staging buffer and reuses the buffer at
+  once. Other copies go to the GPU in order.
+- GX2Invalidate's CPU flag (and DMA engine transfers) tell the renderer the
+  CPU wrote memory (`gpu::cpu_wrote`); SURFACE_SYNC packets are GPU cache
+  operations only. The title flushes the whole texture cache several times
+  a frame, which says nothing about what changed.
 - Audio: each 3 ms AX frame runs the frame callbacks, then the device
   final-mix callbacks with 48 kHz planar buffers (TV 6 channels, GamePad
   4 x 2). The title's CRI middleware mixes in software and drives its
   engine from these callbacks; output is silent until voices are mixed.
+
+### Latte shaders
+
+`runtime/src/latte/` decodes Latte microcode (control flow, ALU groups,
+texture and vertex fetches, subroutines) and translates it to GLSL
+(`translate.cpp`). Each invocation runs as one thread of the console GPU:
+GPRs are integer `ivec4`s that float instructions bit-cast, an ALU group
+reads every operand before it writes, PV/PS carry the previous group's
+results, and DX9-style `MUL`/`MULADD`/`DOT4` treat 0 × anything as 0. The
+per-thread active mask and push/pop stack are variables, so every clause
+is guarded and the jumps that only skip inactive threads are dropped;
+DX10 loops become `while` loops with `break`. What the microcode does not
+decide (vertex semantics, the VS→PS parameter linkage, texture types,
+render target number types, alpha test, point sprites, stream-out) comes
+from the register file (`environment.cpp`) and is part of the shader key.
+The fetch shader is inlined at `CALL_FS`.
+
+Shaders read guest memory directly through buffer device addresses
+(`shader_abi.h`): vertex buffers (decoded and endian-swapped in the
+shader), uniform blocks (raw little-endian, as the title stores them) and
+buffer fetches; stream-out (`MEM_STREAM`) writes guest memory the same
+way. `cafe-shader translate <dump dir>` translates and compiles every
+draw recorded with `TTT2_DUMP_SHADERS`.
+
+### Vulkan renderer
+
+`runtime/src/gpu/vulkan/`: Vulkan 1.3 with dynamic rendering, push
+descriptors and extended dynamic state; one pipeline per shader pair,
+attachment formats and blend state.
+
+- Guest memory (MEM2, MEM1) is imported with VK_EXT_external_memory_host,
+  so the GPU reads the title's buffers in place.
+- The renderer is synchronous with the command processor: work is
+  submitted and waited for before a submission's timestamp retires, an
+  end-of-pipe event is written or a frame completes. Everything the guest
+  can observe follows the GPU work it depends on, and buffers it reuses
+  after a wait are no longer read.
+- Render targets and depth buffers are GPU images keyed by address,
+  format and size (the title aliases memory between differently sized
+  targets). A texture is an image per resource: copied from a render
+  target at its address if the GPU wrote that last, otherwise detiled from
+  guest memory and reloaded when the CPU writes it and its hash changes.
+  Depth buffers sampled as textures are copied through a buffer.
+- Detiling (`gpu/tiling.cpp`) uses addrlib once per 8×8 micro tile: in
+  thin single-sample modes every micro tile has the same internal layout
+  (verified against per-element addrlib, `TTT2_CHECK_TILING=1`).
+- The TV scan buffer is blitted, letterboxed, to an SDL3 window
+  (`runtime/src/host/window.cpp`, on the process's main thread).
+- Compiled SPIR-V and the Vulkan pipeline cache persist in
+  `~/.cache/ttt2` (`$XDG_CACHE_HOME/ttt2`).
 
 ## Running the port
 
@@ -130,13 +189,29 @@ function is plain C++ registered with `CAFE_EXPORT(module, name, fn)`, and
 anything not implemented stops with the function's name and a guest
 backtrace. Iterating on the runtime rebuilds and relinks in ~2 s.
 
+The window shows the TV image (F11 toggles fullscreen). Keyboard: arrows
+D-pad, X/Z/S/A the A/B/X/Y buttons, Q/W L/R, 1/2 ZL/ZR, Enter +, Backspace
+−, H Home, I/J/K/L the left stick; SDL gamepads map by button position.
+`TTT2_GPU=null` runs headless without a window.
+
 Debugging: every guest function is a native function (`sub_XXXXXXXX_orig`),
 so gdb breakpoints, watchpoints and backtraces work on guest code directly;
 host threads are named `<OSThread address>/<core>`. The export thunks take
 `(PPCContext&, uint8_t* base)`, so `$rsi` in any `imp_*` frame is the guest
 base address. `TTT2_TRACE_THREADS=1` logs thread creation, priorities,
-affinities and names. The null GPU backend prints frames per second and
-draws per frame every ten seconds.
+affinities and names. The GPU backends print frames per second and draws
+per frame every ten seconds. Renderer debugging:
+
+| Variable | Effect |
+| --- | --- |
+| `TTT2_CAPTURE=<dir>` | TV/GamePad images as PNG every `TTT2_CAPTURE_INTERVAL` seconds (default 5) |
+| `TTT2_TRACE_AT=<s>`, `TTT2_TRACE_FRAME=<n>` | log every command of one frame; with `TTT2_CAPTURE`, save all its render targets |
+| `TTT2_INPUT_SCRIPT="25:plus,26.5:a"` | press GamePad buttons at given seconds, for unattended runs |
+| `TTT2_DUMP_SHADERS=<dir>` | shader binaries, draw registers and generated GLSL |
+| `TTT2_DUMP_TEXTURES=<dir>` | every texture loaded from memory, as PNG |
+| `TTT2_TRACE_TARGETS=1`, `TTT2_WATCH=<hex address>` | render target creation; writes and loads touching an address |
+| `TTT2_CHECK_TILING=1` | compare fast detiling with addrlib per element |
+| `TTT2_VK_VALIDATION=1` | Khronos validation layer, if installed |
 
 ## Verification
 
@@ -179,7 +254,7 @@ draws per frame every ten seconds.
 | M0 | Loader, decoder, census | Done 2026-10-01 |
 | M1 | Code generator for the full ISA | Done 2026-10-01: all 205,200 entries compile (`--all`, 14 min); semantics and control-flow tests pass with 0 mismatches |
 | M2 | Runtime core, boot | Done 2026-10-01: the game runs its main loop at a steady 59.9 frames/s (vsync-paced) on the null GPU backend, every static import implemented |
-| M3 | GX2 → Vulkan | Title/logo screens render correctly |
+| M3 | GX2 → Vulkan | Done 2026-10-01: intro movie, logos, title screen, attract-mode fights, main menu and character select render correctly at ~58 frames/s |
 | M4 | Input, audio, filesystem, saves | Menus navigable with sound |
 | M5 | Gameplay | Offline match playable start to finish |
 | M6 | Hardening | All stages/characters, long runs, performance |
