@@ -73,6 +73,16 @@ Implemented in host C++, no guest-code interpretation:
 Cemu, decaf-emu and nWiiURecomp are references and test oracles only; nothing
 from them ships in the port.
 
+## Running the port
+
+`build-port/ttt2 "<path>/TEKKEN TAG 2 Wii U EDITION (EU).wua"` reads the
+executable and all assets from the archive in place (a directory with
+code/, content/, meta/ also works). Saves go to `$TTT2_SAVE_DIR`, default
+`~/.local/share/ttt2/save`. The OS layer is in `runtime/src/os/`; each OS
+function is plain C++ registered with `CAFE_EXPORT(module, name, fn)`, and
+anything not implemented stops with the function's name and a guest
+backtrace. Iterating on the runtime rebuilds and relinks in ~2 s.
+
 ## Verification
 
 - Per-instruction differential tests (`build/tests/semantics_test`, done):
@@ -104,8 +114,8 @@ from them ships in the port.
 | | Milestone | Exit criterion |
 | --- | --- | --- |
 | M0 | Loader, decoder, census | Done 2026-10-01 |
-| M1 | Code generator for the full ISA | All 205k functions compile; instruction tests pass. **In progress:** reachable set builds and runs; semantics test passes; control-flow tests and a `--all` build remain |
-| M2 | Runtime core, boot | Entry point runs to the game's main loop with stubbed GPU/audio |
+| M1 | Code generator for the full ISA | Done 2026-10-01: all 205,200 entries compile (`--all`, 14 min); semantics and control-flow tests pass with 0 mismatches |
+| M2 | Runtime core, boot | Entry point runs to the game's main loop with stubbed GPU/audio. **In progress:** all system initialisation runs; stops at `GX2Init` |
 | M3 | GX2 → Vulkan | Title/logo screens render correctly |
 | M4 | Input, audio, filesystem, saves | Menus navigable with sound |
 | M5 | Gameplay | Offline match playable start to finish |
