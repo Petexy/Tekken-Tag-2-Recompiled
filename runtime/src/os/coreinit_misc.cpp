@@ -269,10 +269,11 @@ void __gh_set_errno(int32_t value) { field<int32_t>(current_thread()->guest, ost
 struct GuestRecursiveLock {
     Thread* owner = nullptr;
     int depth = 0;
+    uint32_t key() const { return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(this)); }
     void lock() {
         KernelLock guard(kernel_mutex());
         Thread* self = current_thread();
-        wait_until(guard, [&] { return owner == nullptr || owner == self; });
+        wait_until(guard, key(), [&] { return owner == nullptr || owner == self; });
         owner = self;
         ++depth;
     }
@@ -288,7 +289,7 @@ struct GuestRecursiveLock {
         KernelLock guard(kernel_mutex());
         if (owner == current_thread() && --depth == 0) {
             owner = nullptr;
-            wake_all();
+            wake(key());
         }
     }
 };

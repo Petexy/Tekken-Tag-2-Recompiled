@@ -20,7 +20,6 @@ namespace {
 using namespace osthread;
 
 std::mutex g_kernel;
-std::condition_variable g_kernel_cv;
 std::unordered_map<uint32_t, Thread*> g_threads; // OSThread address -> host thread
 thread_local Thread* t_current = nullptr;
 uint16_t g_next_thread_id = 1;
@@ -103,12 +102,13 @@ void finish(Thread* t, uint32_t exit_value) {
             g_deferred.push_back([deallocator, thread, stack](PPCContext& ctx) {
                 call_guest(ctx, deallocator, {thread, stack});
             });
+            wake(kWaitDeferred);
         }
         g_threads.erase(thread);
     } else {
         set_state(thread, kMoribund);
     }
-    wake_all();
+    wake(thread); // joiners
 }
 
 void* host_main(void* argument) {
@@ -152,7 +152,7 @@ void* system_thread_main(void*) {
         std::function<void(PPCContext&)> work;
         {
             KernelLock lock(g_kernel);
-            g_kernel_cv.wait(lock, [] { return !g_deferred.empty(); });
+            wait_channel(kWaitDeferred).wait(lock, [] { return !g_deferred.empty(); });
             work = std::move(g_deferred.front());
             g_deferred.pop_front();
         }
@@ -187,9 +187,14 @@ void bind_current_thread(Thread* t) {
 }
 
 std::mutex& kernel_mutex() { return g_kernel; }
-std::condition_variable& kernel_cv() { return g_kernel_cv; }
 Thread* current_thread() { return t_current; }
-void wake_all() { g_kernel_cv.notify_all(); }
+
+std::condition_variable& wait_channel(uint32_t key) {
+    static std::condition_variable channels[256];
+    return channels[(key * 0x9E3779B1u) >> 24];
+}
+
+void wake(uint32_t key) { wait_channel(key).notify_all(); }
 
 Thread* thread_for(uint32_t guest_thread) {
     const auto it = g_threads.find(guest_thread);
@@ -298,7 +303,6 @@ int32_t OSResumeThread(GuestAddress thread) {
             start_host_thread(t);
         }
     }
-    wake_all();
     return previous;
 }
 
@@ -319,7 +323,7 @@ bool OSJoinThread(PPCContext& ctx, GuestAddress thread, uint32_t* exit_value) {
         if (t == nullptr || (*guest<uint8_t>(thread.value + kAttr) & kDetached)) {
             return false;
         }
-        wait_until(lock, [&] { return t->finished; });
+        wait_until(lock, thread.value, [&] { return t->finished; });
         if (exit_value != nullptr) {
             *reinterpret_cast<be<uint32_t>*>(exit_value) = field<uint32_t>(thread.value, kExitValue);
         }
@@ -399,7 +403,7 @@ uint32_t OSSetThreadDeallocator(GuestAddress thread, uint32_t deallocator) {
 void OSSleepTicks(uint64_t ticks) {
     const uint64_t ns = ticks / 62156250u * 1000000000u + ticks % 62156250u * 1000000000u / 62156250u;
     KernelLock lock(g_kernel);
-    wait_until_for(lock, ns, [] { return false; });
+    wait_until_for(lock, kWaitNothing, ns, [] { return false; });
 }
 
 void OSYieldThread() { std::this_thread::yield(); }

@@ -46,7 +46,7 @@ void arm(uint32_t alarm, uint64_t when) {
     field<uint64_t>(alarm, 0x18) = when;
     g_schedule.emplace(when, alarm);
     g_armed.insert(alarm);
-    wake_all();
+    wake(kWaitAlarms);
 }
 
 void* alarm_main(void*) {
@@ -55,14 +55,14 @@ void* alarm_main(void*) {
     KernelLock lock(kernel_mutex());
     for (;;) {
         if (g_schedule.empty()) {
-            kernel_cv().wait(lock);
+            wait_channel(kWaitAlarms).wait(lock);
             continue;
         }
         const uint64_t now = cafe_ppc_timebase();
         const auto next = g_schedule.begin();
         if (next->first > now) {
             const uint64_t wait = (next->first - now) * 1000000000ull / kTimerHz;
-            kernel_cv().wait_for(lock, std::chrono::nanoseconds(wait));
+            wait_channel(kWaitAlarms).wait_for(lock, std::chrono::nanoseconds(wait));
             continue;
         }
         const uint32_t alarm = next->second;

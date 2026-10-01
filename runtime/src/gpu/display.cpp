@@ -47,7 +47,7 @@ void display_main() {
             if (g_frames_ready > g_flips && g_vsyncs - g_last_flip_vsync >= std::max<uint32_t>(g_swap_interval, 1)) {
                 flip(now);
             }
-            os::wake_all();
+            os::wake(os::kWaitDisplay);
         }
         // Far behind (debugger, suspended process): resynchronise.
         if (std::chrono::steady_clock::now() - next > kRefreshPeriod * 10) next = std::chrono::steady_clock::now();
@@ -74,20 +74,20 @@ void frame_ready() {
     os::KernelLock lock(os::kernel_mutex());
     ++g_frames_ready;
     if (g_swap_interval == 0) flip(cafe_ppc_timebase());
-    os::wake_all();
+    os::wake(os::kWaitDisplay);
 }
 
 void wait_for_vsync() {
     os::KernelLock lock(os::kernel_mutex());
     const uint64_t target = g_vsyncs + 1;
-    os::wait_until(lock, [&] { return g_vsyncs >= target; });
+    os::wait_until(lock, os::kWaitDisplay, [&] { return g_vsyncs >= target; });
 }
 
 void wait_for_flip() {
     os::KernelLock lock(os::kernel_mutex());
     if (g_flips == g_swaps) return; // nothing pending
     const uint32_t target = g_flips + 1;
-    os::wait_until(lock, [&] { return g_flips >= target; });
+    os::wait_until(lock, os::kWaitDisplay, [&] { return g_flips >= target; });
 }
 
 void set_swap_interval(uint32_t interval) {

@@ -32,7 +32,7 @@ std::unordered_map<uint32_t, uint64_t> g_generations;
 uint32_t mutex_owner(uint32_t m) { return field<uint32_t>(m, 0x1C); }
 
 void lock_mutex(KernelLock& lock, uint32_t mutex, uint32_t self) {
-    wait_until(lock, [&] {
+    wait_until(lock, mutex, [&] {
         const uint32_t owner = mutex_owner(mutex);
         return owner == 0 || owner == self;
     });
@@ -48,14 +48,14 @@ void unlock_mutex(uint32_t mutex, uint32_t self) {
     count -= 1;
     if (count == 0) {
         field<uint32_t>(mutex, 0x1C) = 0;
-        wake_all();
+        wake(mutex);
     }
 }
 
 } // namespace
 
 void acquire_interrupt_lock(KernelLock& lock, Thread* self) {
-    kernel_cv().wait(lock, [&] { return g_interrupt_owner == nullptr || g_interrupt_owner == self; });
+    wait_channel(kWaitInterrupts).wait(lock, [&] { return g_interrupt_owner == nullptr || g_interrupt_owner == self; });
     g_interrupt_owner = self;
     self->interrupts_disabled = true;
 }
@@ -65,7 +65,7 @@ void release_interrupt_lock_for_wait(Thread* self, bool& was_held) {
     if (was_held) {
         g_interrupt_owner = nullptr;
         self->interrupts_disabled = false;
-        wake_all();
+        wake(kWaitInterrupts);
     }
 }
 
@@ -141,10 +141,10 @@ void OSWaitCond(GuestAddress cond, GuestAddress mutex) {
     const int32_t depth = field<int32_t>(mutex.value, 0x20);
     field<int32_t>(mutex.value, 0x20) = 0;
     field<uint32_t>(mutex.value, 0x1C) = 0;
-    wake_all();
+    wake(mutex.value);
     const uint64_t generation = g_generations[cond.value];
-    wait_until(lock, [&] { return g_generations[cond.value] != generation; });
-    wait_until(lock, [&] { return mutex_owner(mutex.value) == 0; });
+    wait_until(lock, cond.value, [&] { return g_generations[cond.value] != generation; });
+    wait_until(lock, mutex.value, [&] { return mutex_owner(mutex.value) == 0; });
     field<uint32_t>(mutex.value, 0x1C) = self;
     field<int32_t>(mutex.value, 0x20) = depth;
 }
@@ -153,7 +153,7 @@ void OSWaitCond(GuestAddress cond, GuestAddress mutex) {
 void OSSignalCond(GuestAddress cond) {
     KernelLock lock(kernel_mutex());
     ++g_generations[cond.value];
-    wake_all();
+    wake(cond.value);
 }
 
 // -------------------------------------------------------------- semaphore
@@ -167,7 +167,7 @@ void OSInitSemaphore(GuestAddress semaphore, int32_t count) {
 int32_t OSWaitSemaphore(GuestAddress semaphore) {
     KernelLock lock(kernel_mutex());
     be<int32_t>& count = field<int32_t>(semaphore.value, 0x0C);
-    wait_until(lock, [&] { return count > 0; });
+    wait_until(lock, semaphore.value, [&] { return count > 0; });
     const int32_t previous = count;
     count = previous - 1;
     return previous;
@@ -186,7 +186,7 @@ int32_t OSSignalSemaphore(GuestAddress semaphore) {
     be<int32_t>& count = field<int32_t>(semaphore.value, 0x0C);
     const int32_t previous = count;
     count = previous + 1;
-    wake_all();
+    wake(semaphore.value);
     return previous;
 }
 
@@ -226,9 +226,9 @@ bool wait_event(KernelLock& lock, uint32_t e, const uint64_t* timeout_ns) {
     const auto ready = [&] { return state != 0u || w.handoffs > 0 || w.generation != generation; };
     bool obtained = true;
     if (timeout_ns != nullptr) {
-        obtained = wait_until_for(lock, *timeout_ns, ready);
+        obtained = wait_until_for(lock, e, *timeout_ns, ready);
     } else {
-        wait_until(lock, ready);
+        wait_until(lock, e, ready);
     }
     --w.waiting;
     if (!obtained) return false;
@@ -268,7 +268,7 @@ void signal_event(uint32_t e, bool everyone) {
     } else {
         state = 1u;
     }
-    wake_all();
+    wake(e);
 }
 
 void OSSignalEvent(GuestAddress event) {
@@ -307,7 +307,7 @@ bool OSSendMessage(GuestAddress queue, GuestAddress message, uint32_t flags) {
     be<uint32_t>& first = field<uint32_t>(q, 0x34);
     if (used == capacity) {
         if (!(flags & kMessageBlocking)) return false;
-        wait_until(lock, [&] { return used < capacity; });
+        wait_until(lock, q, [&] { return used < capacity; });
     }
     uint32_t slot;
     if (flags & kMessageHighPriority) {
@@ -319,7 +319,7 @@ bool OSSendMessage(GuestAddress queue, GuestAddress message, uint32_t flags) {
     }
     std::memcpy(guest_pointer(field<uint32_t>(q, 0x2C) + slot * 16), message.as<uint8_t>(), 16);
     used += 1;
-    wake_all();
+    wake(q);
     return true;
 }
 
@@ -331,12 +331,12 @@ bool OSReceiveMessage(GuestAddress queue, GuestAddress message, uint32_t flags) 
     be<uint32_t>& first = field<uint32_t>(q, 0x34);
     if (used == 0u) {
         if (!(flags & kMessageBlocking)) return false;
-        wait_until(lock, [&] { return used != 0u; });
+        wait_until(lock, q, [&] { return used != 0u; });
     }
     std::memcpy(message.as<uint8_t>(), guest_pointer(field<uint32_t>(q, 0x2C) + first * 16), 16);
     first = (first + 1) % capacity;
     used -= 1;
-    wake_all();
+    wake(q);
     return true;
 }
 
@@ -346,13 +346,13 @@ void OSInitThreadQueue(GuestAddress queue) { std::memset(queue.as<uint8_t>(), 0,
 void OSSleepThread(GuestAddress queue) {
     KernelLock lock(kernel_mutex());
     const uint64_t generation = g_generations[queue.value];
-    wait_until(lock, [&] { return g_generations[queue.value] != generation; });
+    wait_until(lock, queue.value, [&] { return g_generations[queue.value] != generation; });
 }
 
 void OSWakeupThread(GuestAddress queue) {
     KernelLock lock(kernel_mutex());
     ++g_generations[queue.value];
-    wake_all();
+    wake(queue.value);
 }
 
 } // namespace

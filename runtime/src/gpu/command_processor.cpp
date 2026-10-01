@@ -356,7 +356,7 @@ void execute(uint32_t address, uint32_t words, int depth) {
 void retire(uint64_t timestamp) {
     os::KernelLock lock(os::kernel_mutex());
     g_retired = timestamp;
-    os::wake_all();
+    os::wake(os::kWaitGpu);
 }
 
 void command_processor_main() {
@@ -419,7 +419,7 @@ uint64_t retired_timestamp() {
 
 bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns) {
     os::KernelLock lock(os::kernel_mutex());
-    return os::wait_until_for(lock, timeout_ns, [&] { return g_retired >= timestamp; });
+    return os::wait_until_for(lock, os::kWaitGpu, timeout_ns, [&] { return g_retired >= timestamp; });
 }
 
 uint64_t clock() { return cafe_ppc_timebase(); }

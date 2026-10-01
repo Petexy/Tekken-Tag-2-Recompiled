@@ -65,9 +65,8 @@ struct Thread {
     std::jmp_buf exit_jump{};
 };
 
-// The kernel lock and the condition every blocked thread waits on.
+// The kernel lock, held while any kernel object is examined or changed.
 std::mutex& kernel_mutex();
-std::condition_variable& kernel_cv();
 using KernelLock = std::unique_lock<std::mutex>;
 
 Thread* current_thread();
@@ -78,14 +77,29 @@ Thread* create_internal_thread(const char* name, int core);
 void bind_current_thread(Thread* t);
 Thread* thread_for(uint32_t guest_thread); // null for unknown structures
 
-// Blocks the calling thread until `ready()` holds. Gives up the interrupt
-// lock while blocked, as a context switch would on hardware.
+// Wait channels: a blocked thread sleeps on the channel of the object it
+// waits for, keyed by the object's guest address (or one of the runtime
+// keys below), and waking an object notifies only its channel. Keys share
+// channels by hash, so a woken thread always re-checks its condition.
+enum WaitKey : uint32_t {
+    kWaitInterrupts = 1, // the interrupt lock
+    kWaitDisplay = 2,    // vsync and flip counters
+    kWaitGpu = 3,        // retired timestamps
+    kWaitAlarms = 4,     // the alarm schedule
+    kWaitNothing = 5,    // timed sleeps nothing ends early
+    kWaitDeferred = 6,   // work for the system thread
+};
+std::condition_variable& wait_channel(uint32_t key);
+void wake(uint32_t key);
+
+// Blocks the calling thread until `ready()` holds; `key` names what it
+// waits for. Gives up the interrupt lock while blocked, as a context switch
+// would on hardware.
 template <typename Predicate>
-void wait_until(KernelLock& lock, Predicate ready);
+void wait_until(KernelLock& lock, uint32_t key, Predicate ready);
 // Same, with a timeout in nanoseconds; returns whether `ready()` held.
 template <typename Predicate>
-bool wait_until_for(KernelLock& lock, uint64_t nanoseconds, Predicate ready);
-void wake_all();
+bool wait_until_for(KernelLock& lock, uint32_t key, uint64_t nanoseconds, Predicate ready);
 
 // OSDisableInterrupts as a global critical section (see sync.cpp).
 void acquire_interrupt_lock(KernelLock& lock, Thread* self);
@@ -107,23 +121,23 @@ int run_main_thread(uint32_t entry, uint32_t argc, uint32_t argv, uint32_t stack
 
 // ---- implementation of the wait templates
 template <typename Predicate>
-void wait_until(KernelLock& lock, Predicate ready) {
+void wait_until(KernelLock& lock, uint32_t key, Predicate ready) {
     Thread* self = current_thread();
     if (ready()) return;
     bool held = false;
     release_interrupt_lock_for_wait(self, held);
-    kernel_cv().wait(lock, ready);
+    wait_channel(key).wait(lock, ready);
     reacquire_interrupt_lock_after_wait(lock, self, held);
 }
 
 template <typename Predicate>
-bool wait_until_for(KernelLock& lock, uint64_t nanoseconds, Predicate ready) {
+bool wait_until_for(KernelLock& lock, uint32_t key, uint64_t nanoseconds, Predicate ready) {
     Thread* self = current_thread();
     if (ready()) return true;
     bool held = false;
     release_interrupt_lock_for_wait(self, held);
     const bool result =
-        kernel_cv().wait_for(lock, std::chrono::nanoseconds(nanoseconds), ready);
+        wait_channel(key).wait_for(lock, std::chrono::nanoseconds(nanoseconds), ready);
     reacquire_interrupt_lock_after_wait(lock, self, held);
     return result;
 }
