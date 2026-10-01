@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace cafe {
 
@@ -33,7 +34,7 @@ struct LoadedImage {
 
 // Loads the RPX the code was generated from into guest memory, applying
 // relocations exactly as the recompiler did. Refuses any other build.
-LoadedImage load_image(const std::filesystem::path& rpx);
+LoadedImage load_image(const std::vector<uint8_t>& rpx_bytes);
 
 // ---------------------------------------------------------------- dispatch
 void build_dispatch_table();

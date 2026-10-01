@@ -163,7 +163,10 @@ const Section* Image::section_containing(uint32_t address) const {
 }
 
 Image load(const std::filesystem::path& path, bool apply_relocations) {
-    const std::vector<uint8_t> raw = read_file(path);
+    return load(read_file(path), apply_relocations);
+}
+
+Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
     if (raw.size() < 52 || raw[0] != 0x7F || raw[1] != 'E' || raw[2] != 'L' ||
         raw[3] != 'F' || raw[4] != 1 || raw[5] != 2) {
         fail("not a big-endian ELF32 file");

@@ -115,6 +115,7 @@ struct Image {
 // section placed at its sh_addr. Function imports resolve to their stub slots;
 // data imports to cafe::layout data-import slots, in symbol-table order.
 Image load(const std::filesystem::path& path, bool apply_relocations = true);
+Image load(const std::vector<uint8_t>& raw, bool apply_relocations = true);
 
 inline uint32_t read_be32(const uint8_t* p) {
     return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) |

@@ -7,19 +7,13 @@
 #include <openssl/evp.h>
 
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <vector>
 
 namespace cafe {
 namespace {
 
-std::string sha256_of(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        fatal("cannot open %s", path.c_str());
-    }
-    const std::vector<char> data{std::istreambuf_iterator<char>(input), {}};
+std::string sha256_of(const std::vector<uint8_t>& data) {
     unsigned char digest[32];
     unsigned int length = 0;
     EVP_Digest(data.data(), data.size(), digest, &length, EVP_sha256(), nullptr);
@@ -34,16 +28,16 @@ std::string sha256_of(const std::filesystem::path& path) {
 
 } // namespace
 
-LoadedImage load_image(const std::filesystem::path& path) {
-    const std::string digest = sha256_of(path);
+LoadedImage load_image(const std::vector<uint8_t>& rpx_bytes) {
+    const std::string digest = sha256_of(rpx_bytes);
     if (digest != cafe_program_info.rpx_sha256) {
-        fatal("%s is not the executable this port was generated from\n"
+        fatal("this Tekken.rpx is not the executable the port was generated from\n"
               "  expected sha256 %s\n  found           %s",
-              path.c_str(), cafe_program_info.rpx_sha256, digest.c_str());
+              cafe_program_info.rpx_sha256, digest.c_str());
     }
     // Same loader, same relocation and data-import placement as cafe-recomp,
     // so addresses baked into the generated code match memory.
-    const rpx::Image image = rpx::load(path);
+    const rpx::Image image = rpx::load(rpx_bytes);
 
     LoadedImage loaded;
     loaded.entry_point = image.entry_point;

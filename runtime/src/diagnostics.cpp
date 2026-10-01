@@ -72,7 +72,10 @@ void fatal(const char* format, ...) {
     if (t_current != nullptr) {
         print_guest_state(*t_current);
     }
-    std::exit(70);
+    std::fflush(stderr);
+    // Not exit(): other guest threads still use the objects static
+    // destructors would tear down.
+    std::_Exit(70);
 }
 
 void install_fault_handler() {

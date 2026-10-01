@@ -22,4 +22,19 @@ constexpr uint32_t kDataImportLimit = 0x0FF80000;
 constexpr uint32_t kHostThunkBase = 0x0FF80000;
 constexpr uint32_t kHostThunkLimit = 0x10000000;
 
+// The Wii U virtual memory map as titles see it (addresses from Cemu's MMU
+// map and the PPC kernel). Only the ranges in use are committed.
+constexpr uint32_t kSystemHeapBase = 0x01000000; // OS-owned guest objects
+constexpr uint32_t kSystemHeapSize = 0x00800000;
+constexpr uint32_t kCodeBase = 0x02000000;
+constexpr uint32_t kMem2Base = 0x10000000;
+constexpr uint32_t kMem2End = 0x50000000;
+constexpr uint32_t kForegroundBucketBase = 0xE0000000;
+constexpr uint32_t kForegroundBucketSize = 0x04000000;
+constexpr uint32_t kMem1Base = 0xF4000000;
+constexpr uint32_t kMem1Size = 0x02000000;
+// Each core's locked-cache scratchpad (LCAlloc), 16 KiB.
+constexpr uint32_t kLockedCacheBase[3] = {0xFFC00000, 0xFFC40000, 0xFFC80000};
+constexpr uint32_t kLockedCacheSize = 0x4000;
+
 } // namespace cafe::layout
