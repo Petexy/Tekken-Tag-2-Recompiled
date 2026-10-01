@@ -1,0 +1,7 @@
+/local/
+/build/
+/build-*/
+/third_party/
+/generated/
+__pycache__/
+*.pyc

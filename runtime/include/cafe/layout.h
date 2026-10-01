@@ -1,0 +1,25 @@
+#pragma once
+
+// Guest address-space decisions the recompiler bakes into generated code and
+// the runtime must reproduce. Changing any value requires regenerating.
+
+#include <cstdint>
+
+namespace cafe::layout {
+
+// Imported data objects (coreinit's _iob, MEMAllocFromDefaultHeap, ...). The
+// RPX's 8-byte stub slots are too small: Tekken addresses _iob + 16. Each
+// object gets its own slot here, in import order, so recompiler and runtime
+// agree without a side table. The range sits in the code region above the
+// game's .text, where nothing else is mapped.
+constexpr uint32_t kDataImportBase = 0x0FF00000;
+constexpr uint32_t kDataImportSlot = 0x1000;
+constexpr uint32_t kDataImportLimit = 0x0FF80000;
+
+// Guest-visible addresses for native functions the runtime hands to guest
+// code as function pointers (e.g. the value stored in
+// MEMAllocFromDefaultHeap). Indirect calls to these dispatch to host code.
+constexpr uint32_t kHostThunkBase = 0x0FF80000;
+constexpr uint32_t kHostThunkLimit = 0x10000000;
+
+} // namespace cafe::layout
