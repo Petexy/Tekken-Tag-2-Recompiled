@@ -7,7 +7,9 @@
 #include "cafe/export.h"
 #include "cafe/vfs.h"
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -17,6 +19,13 @@ namespace cafe::os {
 namespace {
 
 std::mutex g_fs_mutex;
+
+// TTT2_TRACE_FS=1: every open and read, with the time since start-up.
+const bool g_trace = std::getenv("TTT2_TRACE_FS") != nullptr;
+double seconds() {
+    static const auto start = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
 std::unordered_map<uint32_t, int32_t> g_last_status; // FSClient -> last FSStatus
 
 // FSErrorFlag bits a caller lists in errMask to receive that status back
@@ -84,6 +93,11 @@ int32_t FSOpenFile(GuestAddress client, GuestAddress, uint32_t path, uint32_t mo
     int32_t h = -1;
     const auto status = vfs::open_file(guest_string(path), guest_string(mode), h);
     if (status == vfs::kOk && handle) *handle = h;
+    if (g_trace) {
+        const std::string_view name = guest_string(path);
+        std::fprintf(stderr, "fs: %8.3f open %.*s -> %d\n", seconds(), static_cast<int>(name.size()), name.data(),
+                     status == vfs::kOk ? h : status);
+    }
     return finish(client, status, mask, "open", guest_string(path));
 }
 
@@ -91,7 +105,12 @@ int32_t read_common(GuestAddress client, uint8_t* destination, uint32_t size, ui
                     std::optional<uint64_t> position, int32_t handle, uint32_t mask) {
     if (size == 0 || count == 0) return finish(client, 0, mask, "read");
     uint64_t transferred = 0;
+    const double begin = g_trace ? seconds() : 0.0;
     const auto status = vfs::read_file(handle, destination, uint64_t{size} * count, position, transferred);
+    if (g_trace) {
+        std::fprintf(stderr, "fs: %8.3f read %d %llu bytes in %.1f ms\n", begin, handle,
+                     static_cast<unsigned long long>(transferred), (seconds() - begin) * 1000.0);
+    }
     if (status != vfs::kOk) return finish(client, status, mask, "read");
     return finish(client, static_cast<int32_t>(transferred / size), mask, "read");
 }
@@ -111,6 +130,9 @@ int32_t write_common(GuestAddress client, const uint8_t* source, uint32_t size, 
     if (size == 0 || count == 0) return finish(client, 0, mask, "write");
     uint64_t transferred = 0;
     const auto status = vfs::write_file(handle, source, uint64_t{size} * count, position, transferred);
+    if (g_trace) {
+        std::fprintf(stderr, "fs: %8.3f write %d %llu bytes\n", seconds(), handle, static_cast<unsigned long long>(transferred));
+    }
     if (status != vfs::kOk) return finish(client, status, mask, "write");
     return finish(client, static_cast<int32_t>(transferred / size), mask, "write");
 }
@@ -197,6 +219,10 @@ int32_t SAVEOpenFile(GuestAddress client, GuestAddress block, uint8_t slot, uint
     int32_t h = -1;
     const auto status = vfs::open_file(full, guest_string(mode), h);
     if (status == vfs::kOk && handle) *handle = h;
+    if (g_trace) {
+        std::fprintf(stderr, "fs: %8.3f save open %s (%.*s) -> %d\n", seconds(), full.c_str(),
+                     static_cast<int>(guest_string(mode).size()), guest_string(mode).data(), status == vfs::kOk ? h : status);
+    }
     (void)block;
     return finish(client, status, mask, "SAVEOpenFile", full);
 }
