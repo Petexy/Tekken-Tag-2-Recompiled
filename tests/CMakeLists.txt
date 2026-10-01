@@ -46,6 +46,7 @@ if(EXISTS "${DOLPHIN_CORE}/Core/PowerPC/Interpreter/Interpreter_Tables.cpp"
         ${interp}/Interpreter_Paired.cpp
         ${interp}/Interpreter_LoadStorePaired.cpp
         ${interp}/Interpreter_SystemRegisters.cpp
+        ${interp}/Interpreter_Branch.cpp
         ${DOLPHIN_CORE}/Core/PowerPC/ConditionRegister.cpp
         ${DOLPHIN_CORE}/Common/FloatUtils.cpp)
     target_include_directories(dolphin_oracle PRIVATE
@@ -65,6 +66,21 @@ if(EXISTS "${DOLPHIN_CORE}/Core/PowerPC/Interpreter/Interpreter_Tables.cpp"
     target_link_libraries(semantics_test PRIVATE dolphin_oracle cafe_recomp)
     target_compile_options(semantics_test PRIVATE -O2 -march=x86-64-v3 -Wno-unused-label)
     add_test(NAME semantics_test COMMAND semantics_test)
+
+    add_executable(cafe-cfgen oracle/cfgen_main.cpp)
+    target_link_libraries(cafe-cfgen PRIVATE cafe_recomp)
+    set(control_flow_cases "${CMAKE_CURRENT_BINARY_DIR}/control_flow_cases.cpp")
+    add_custom_command(OUTPUT "${control_flow_cases}"
+        COMMAND cafe-cfgen "${control_flow_cases}"
+        DEPENDS cafe-cfgen
+        COMMENT "Assembling control-flow test programs"
+        VERBATIM)
+    add_executable(control_flow_test oracle/control_flow_test.cpp "${control_flow_cases}")
+    target_include_directories(control_flow_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/runtime/include ${CMAKE_CURRENT_SOURCE_DIR}/oracle)
+    target_link_libraries(control_flow_test PRIVATE dolphin_oracle)
+    target_compile_options(control_flow_test PRIVATE -O2 -march=x86-64-v3 -Wno-unused-label)
+    add_test(NAME control_flow_test COMMAND control_flow_test)
 else()
     message(STATUS "semantics_test disabled: needs third_party/ref/dolphin, fmt and TTT2_RPX")
 endif()

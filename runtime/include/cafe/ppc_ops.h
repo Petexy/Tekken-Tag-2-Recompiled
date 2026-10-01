@@ -23,6 +23,7 @@ extern "C" {
 [[noreturn]] void cafe_ppc_illegal(::cafe::PPCContext& ctx, uint32_t address,
                                    uint32_t word, const char* reason);
 [[noreturn]] void cafe_ppc_null_call(::cafe::PPCContext& ctx, uint32_t address);
+[[noreturn]] void cafe_ppc_bad_return(::cafe::PPCContext& ctx, uint32_t expected);
 uint64_t cafe_ppc_timebase(void);
 }
 
@@ -52,6 +53,23 @@ uint64_t cafe_ppc_timebase(void);
 // is unbounded in guest code.
 #define PPC_TAIL_CALL(fn) PPC_MUSTTAIL return fn(ctx, base)
 #define PPC_CALL_INDIRECT(target) cafe_ppc_lookup(target)(ctx, base)
+// A guest call becomes a host call, so execution resumes after the call site
+// when the callee returns. That matches the guest only if the callee's blr
+// went to the address the call put in LR; anything else (longjmp-style
+// returns) must stop loudly rather than continue in the wrong place.
+#ifndef PPC_CHECK_RETURNS
+#define PPC_CHECK_RETURNS 1
+#endif
+#if PPC_CHECK_RETURNS
+#define PPC_CHECK_RETURN(expected)                                             \
+    do {                                                                       \
+        if (__builtin_expect(ctx.lr != (expected), 0))                         \
+            cafe_ppc_bad_return(ctx, (expected));                              \
+    } while (0)
+#else
+#define PPC_CHECK_RETURN(expected) ((void)0)
+#endif
+
 #define PPC_TAIL_CALL_INDIRECT(target)                                         \
     do {                                                                       \
         ::cafe::PPCFunc* const ppc_fn_ = cafe_ppc_lookup(target);              \

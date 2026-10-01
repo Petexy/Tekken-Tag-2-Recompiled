@@ -23,28 +23,9 @@ void Interpreter::unknown_instruction(Interpreter& interpreter, UGeckoInstructio
     interpreter.m_ppc_state.Exceptions |= EXCEPTION_PROGRAM;
 }
 
-// Branches and system calls are tested outside the oracle; Interpreter_Branch
-// drags in Dolphin's HLE layer, so it is not built.
-#define ORACLE_UNTESTED(name)                                                  \
-    void Interpreter::name(Interpreter& interpreter, UGeckoInstruction) {      \
-        interpreter.m_ppc_state.Exceptions |= EXCEPTION_PROGRAM;               \
-    }
-ORACLE_UNTESTED(bx)
-ORACLE_UNTESTED(bcx)
-ORACLE_UNTESTED(bcctrx)
-ORACLE_UNTESTED(bclrx)
-ORACLE_UNTESTED(HLEFunction)
-ORACLE_UNTESTED(rfi)
-ORACLE_UNTESTED(sc)
+namespace {
 
-bool oracle_execute(OracleState& s, uint8_t* memory, uint32_t word) {
-    PowerPC::MMU mmu(memory);
-    Core::System system(mmu);
-    Core::BranchWatch branch_watch;
-    PPCSymbolDB symbols;
-    PowerPC::PowerPCState ppc{};
-    Interpreter interpreter(system, ppc, mmu, branch_watch, symbols);
-
+void load_state(PowerPC::PowerPCState& ppc, const OracleState& s) {
     for (int i = 0; i < 32; ++i) {
         ppc.gpr[i] = s.gpr[i];
         ppc.ps[i].ps0 = s.ps0[i];
@@ -65,14 +46,13 @@ bool oracle_execute(OracleState& s, uint8_t* memory, uint32_t word) {
     hid2.PSE = 1;
     hid2.LSQE = 1;
     ppc.spr[SPR_HID2] = hid2.Hex;
+    UReg_HID0 hid0;
+    hid0.DCE = 1; // data cache on, as on the Espresso (dcbz requires it)
+    ppc.spr[SPR_HID0] = hid0.Hex;
     ppc.msr.FP = 1;
+}
 
-    const UGeckoInstruction inst{word};
-    Interpreter::GetInterpreterOp(inst)(interpreter, inst);
-    if (ppc.Exceptions != 0) {
-        return false;
-    }
-
+void store_state(const PowerPC::PowerPCState& ppc, OracleState& s) {
     for (int i = 0; i < 32; ++i) {
         s.gpr[i] = ppc.gpr[i];
         s.ps0[i] = ppc.ps[i].ps0;
@@ -89,5 +69,59 @@ bool oracle_execute(OracleState& s, uint8_t* memory, uint32_t word) {
     s.bc = static_cast<uint8_t>(ppc.xer_stringctrl & 0x7F);
     s.lr = ppc.spr[SPR_LR];
     s.ctr = ppc.spr[SPR_CTR];
+}
+
+} // namespace
+
+bool oracle_execute(OracleState& s, uint8_t* memory, uint32_t word) {
+    PowerPC::MMU mmu(memory);
+    Core::System system(mmu);
+    Core::BranchWatch branch_watch;
+    PPCSymbolDB symbols;
+    PowerPC::PowerPCState ppc{};
+    Interpreter interpreter(system, ppc, mmu, branch_watch, symbols);
+    load_state(ppc, s);
+    const UGeckoInstruction inst{word};
+    Interpreter::GetInterpreterOp(inst)(interpreter, inst);
+    if (ppc.Exceptions != 0) {
+        return false;
+    }
+    store_state(ppc, s);
     return true;
+}
+
+OracleRun oracle_run(OracleState& s, uint8_t* memory, uint32_t entry, uint32_t stop,
+                     uint32_t max_steps) {
+    PowerPC::MMU mmu(memory);
+    Core::System system(mmu);
+    Core::BranchWatch branch_watch;
+    PPCSymbolDB symbols;
+    PowerPC::PowerPCState ppc{};
+    Interpreter interpreter(system, ppc, mmu, branch_watch, symbols);
+    load_state(ppc, s);
+    ppc.pc = entry;
+    for (uint32_t step = 0; step < max_steps; ++step) {
+        if (ppc.pc == stop) {
+            store_state(ppc, s);
+            return OracleRun::returned;
+        }
+        const UGeckoInstruction inst{mmu.Read<u32>(ppc.pc)};
+        ppc.npc = ppc.pc + 4;
+        Interpreter::GetInterpreterOp(inst)(interpreter, inst);
+        // Dolphin (and Cemu) write LR only when a branch-and-link is taken.
+        // The architecture writes it "regardless of whether the branch is
+        // taken" (PowerPC Programming Environments manual, ch. 4, branch
+        // instructions). Correct the oracle to the architecture.
+        const u32 opcd = inst.hex >> 26, xo = (inst.hex >> 1) & 0x3FF;
+        const bool branch = opcd == 16 || opcd == 18 || (opcd == 19 && (xo == 16 || xo == 528));
+        if (branch && (inst.hex & 1)) {
+            LR(ppc) = ppc.pc + 4;
+        }
+        if (ppc.Exceptions != 0) {
+            store_state(ppc, s);
+            return (ppc.Exceptions & EXCEPTION_PROGRAM) ? OracleRun::trapped : OracleRun::exception;
+        }
+        ppc.pc = ppc.npc;
+    }
+    return OracleRun::step_limit;
 }

@@ -20,3 +20,10 @@ struct OracleState {
 // the interpreter raised an exception, in which case the result is not
 // comparable.
 bool oracle_execute(OracleState& state, uint8_t* memory, uint32_t word);
+
+enum class OracleRun { returned, trapped, exception, step_limit };
+
+// Runs code from `entry` until control reaches `stop` (normally the return
+// address placed in LR), fetching instructions from `memory`.
+OracleRun oracle_run(OracleState& state, uint8_t* memory, uint32_t entry, uint32_t stop,
+                     uint32_t max_steps);

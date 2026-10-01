@@ -158,7 +158,7 @@ private:
                                "entry\");",
                                hex(a), hex(w));
         } else if (link) {
-            body = symbol + "(ctx, base);";
+            body = std::format("{}(ctx, base); PPC_CHECK_RETURN({});", symbol, hex(a + 4));
         } else {
             body = std::format("PPC_TAIL_CALL({});", symbol);
         }
@@ -173,7 +173,8 @@ private:
                 line("{");
                 line(std::format("\tconst uint32_t target = ctx.lr; ctx.lr = {};", hex(a + 4)));
                 const std::string cond = condition(bo, ppc::ra(w));
-                guarded(cond, "PPC_CALL_INDIRECT(target);");
+                guarded(cond, std::format("PPC_CALL_INDIRECT(target); PPC_CHECK_RETURN({});",
+                                          hex(a + 4)));
                 line("}");
             } else {
                 guarded(condition(bo, ppc::ra(w)), "return;");
@@ -187,7 +188,8 @@ private:
         }
         if (link) {
             line(std::format("ctx.lr = {};", hex(a + 4)));
-            guarded(condition(bo, ppc::ra(w)), "PPC_CALL_INDIRECT(ctx.ctr);");
+            guarded(condition(bo, ppc::ra(w)),
+                    std::format("PPC_CALL_INDIRECT(ctx.ctr); PPC_CHECK_RETURN({});", hex(a + 4)));
             return;
         }
         std::string body;

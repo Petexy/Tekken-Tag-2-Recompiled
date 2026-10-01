@@ -109,6 +109,14 @@ void cafe_ppc_null_call(cafe::PPCContext& ctx, uint32_t address) {
     cafe::fatal("call through an unresolved weak symbol (address 0) at 0x%08X", address);
 }
 
+void cafe_ppc_bad_return(cafe::PPCContext& ctx, uint32_t expected) {
+    cafe::set_current_context(&ctx);
+    cafe::fatal("a guest call returned with LR=0x%08X instead of its return address "
+                "0x%08X: the callee returned somewhere other than its caller "
+                "(longjmp-style control flow the port does not model yet)",
+                ctx.lr, expected);
+}
+
 // The Espresso time base runs at a quarter of the 248.625 MHz bus clock.
 uint64_t cafe_ppc_timebase(void) {
     static const auto start = std::chrono::steady_clock::now();
