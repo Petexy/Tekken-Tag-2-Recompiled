@@ -214,6 +214,13 @@ attachment formats and blend state.
   (verified against per-element addrlib, `TTT2_CHECK_TILING=1`).
 - The TV scan buffer is blitted, letterboxed, to an SDL3 window
   (`runtime/src/host/window.cpp`, on the process's main thread).
+- Validated 2026-10-02 with the Khronos layer (core, synchronization,
+  object lifetime, thread safety) through boot, menus and a match: no
+  errors or hazards. One warning remains by design,
+  Undefined-Value-ShaderOutputNotConsumed: some depth-only passes use pixel
+  shaders that also write colour, which Vulkan discards when no colour
+  attachment is bound; trimming those outputs would multiply shader
+  variants.
 - Compiled SPIR-V and the Vulkan pipeline cache persist in
   `~/.cache/ttt2` (`$XDG_CACHE_HOME/ttt2`).
 
@@ -256,7 +263,7 @@ per frame every ten seconds. Renderer debugging:
 | `TTT2_DUMP_TEXTURES=<dir>` | every texture loaded from memory, as PNG |
 | `TTT2_TRACE_TARGETS=1`, `TTT2_WATCH=<hex address>` | render target creation; writes and loads touching an address |
 | `TTT2_CHECK_TILING=1` | compare fast detiling with addrlib per element |
-| `TTT2_VK_VALIDATION=1` | Khronos validation layer, if installed |
+| `TTT2_VK_VALIDATION=1` | Khronos validation layer, if installed (synchronization checks: `khronos_validation.validate_sync = true` in a file named by `VK_LAYER_SETTINGS_PATH`) |
 | `TTT2_AUDIO_DUMP=<file.wav>` | everything played, as 48 kHz stereo WAV (also without a device) |
 | `TTT2_TRACE_AX=1` | voice set-up, device mixes, output level |
 | `TTT2_TRACE_FS=1` | file and save opens, reads and writes, with times |
