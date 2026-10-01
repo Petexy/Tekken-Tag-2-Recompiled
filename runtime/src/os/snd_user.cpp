@@ -1,10 +1,16 @@
 // snd_user: sound-effect processors (AXFX reverb/chorus/delay), the MIX
-// channel mixer and AXART articulation. Like the voices in ax.cpp these are
-// modelled for the title's control flow only: set-up succeeds, memory sizes
-// are reported, and processors leave the aux buffers untouched (silence)
-// until audio output is implemented. Generated from the title's import list.
+// channel mixer and AXART articulation. The effects are modelled for the
+// title's control flow only: set-up succeeds and memory sizes are reported;
+// AX does not run aux buses (the title sends nothing to them), so their
+// callbacks are never called. Generated from the title's import list.
+
+#include "ax.h"
 
 #include "cafe/export.h"
+#include "cafe/guest.h"
+
+#include <cmath>
+#include <mutex>
 
 namespace cafe::os {
 
@@ -78,12 +84,107 @@ CAFE_EXPORT_RAW(snd_user, AXFXReverbStdGetMemSize) { ctx.r[3] = kEffectMemory; }
 CAFE_EXPORT_RAW(snd_user, AXFXReverbStdInit) { ctx.r[3] = 1; }
 CAFE_EXPORT_RAW(snd_user, AXFXReverbStdSettings) { ctx.r[3] = 1; }
 CAFE_EXPORT_RAW(snd_user, AXFXReverbStdShutdown) { (void)ctx; }
-CAFE_EXPORT_RAW(snd_user, MIXAssignChannel) { ctx.r[3] = 0; }
-CAFE_EXPORT_RAW(snd_user, MIXInit) { ctx.r[3] = 1; }
-CAFE_EXPORT_RAW(snd_user, MIXInitInputControl) { ctx.r[3] = 0; }
-CAFE_EXPORT_RAW(snd_user, MIXQuit) { ctx.r[3] = 0; }
-CAFE_EXPORT_RAW(snd_user, MIXReleaseChannel) { ctx.r[3] = 0; }
-CAFE_EXPORT_RAW(snd_user, MIXSetDeviceSoundMode) { ctx.r[3] = 0; }
-CAFE_EXPORT_RAW(snd_user, MIXUpdateSettings) { ctx.r[3] = 1; }
+// ------------------------------------------------------------------ MIX
+// The channel mixer drives voice volumes from input levels in 0.1 dB
+// (-90.4 dB and below is silence). The title assigns its voices, sets their
+// input level and calls MIXUpdateSettings every audio frame; it programs
+// device mixes (pan, fader) directly with AXSetVoiceDeviceMix, so only the
+// input-level path is modelled. A level change ramps over one frame.
+
+namespace {
+
+constexpr uint32_t kMixInputChanged = 0x10000000; // input level set
+constexpr uint32_t kMixRamping = 0x20000000;      // VE ramping to the target
+constexpr uint32_t kMixMute = 0x8;
+
+struct MixChannel {
+    uint32_t voice = 0;
+    uint32_t mode = 0;
+    int16_t input = 0;
+    uint16_t volume = 0, target = 0;
+};
+
+std::mutex g_mix_mutex;
+MixChannel g_mix_channels[96];
+bool g_mix_initialized = false;
+
+// 0.1 dB steps to AX volume (0x8000 = 0 dB), as MIX's table has them.
+uint16_t translate_volume(int32_t level) {
+    if (level <= -904) return 0;
+    if (level >= 60) return 0xFF64;
+    if (level == 0) return 0x7FFF;
+    return static_cast<uint16_t>(32768.0 * std::pow(10.0, level / 200.0));
+}
+
+MixChannel* mix_channel(uint32_t voice) {
+    const uint32_t index = voice ? uint32_t{*guest<be<uint32_t>>(voice)} : ~0u;
+    return index < 96 ? &g_mix_channels[index] : nullptr;
+}
+
+void MIXInit() {
+    std::lock_guard lock(g_mix_mutex);
+    if (g_mix_initialized) return;
+    for (MixChannel& c : g_mix_channels) c = MixChannel{};
+    g_mix_initialized = true;
+}
+
+void MIXQuit() {
+    std::lock_guard lock(g_mix_mutex);
+    g_mix_initialized = false;
+}
+
+void MIXAssignChannel(uint32_t voice) {
+    std::lock_guard lock(g_mix_mutex);
+    if (MixChannel* c = mix_channel(voice)) {
+        *c = MixChannel{};
+        c->voice = voice;
+    }
+}
+
+void MIXReleaseChannel(uint32_t voice) {
+    std::lock_guard lock(g_mix_mutex);
+    if (MixChannel* c = mix_channel(voice)) c->voice = 0;
+}
+
+void MIXInitInputControl(uint32_t voice, int16_t input, uint32_t mode) {
+    std::lock_guard lock(g_mix_mutex);
+    if (MixChannel* c = mix_channel(voice)) {
+        c->mode = (mode & kMixMute) | kMixInputChanged;
+        c->input = input;
+    }
+}
+
+void MIXUpdateSettings() {
+    std::lock_guard lock(g_mix_mutex);
+    if (!g_mix_initialized) return;
+    for (MixChannel& c : g_mix_channels) {
+        if (c.voice == 0) continue;
+        bool settled = false;
+        if (c.mode & kMixRamping) {
+            c.volume = c.target;
+            c.mode &= ~kMixRamping;
+            settled = true;
+        }
+        if (c.mode & kMixInputChanged) {
+            c.target = (c.mode & kMixMute) ? 0 : translate_volume(c.input);
+            c.mode = (c.mode & ~kMixInputChanged) | kMixRamping;
+        } else if (!settled) {
+            continue;
+        }
+        set_voice_ve(c.voice, c.volume, static_cast<int16_t>((int32_t{c.target} - int32_t{c.volume}) / 96));
+    }
+}
+
+void MIXSetDeviceSoundMode(uint32_t, uint32_t) {}
+
+} // namespace
+
+CAFE_EXPORT(snd_user, MIXInit, MIXInit);
+CAFE_EXPORT(snd_user, MIXQuit, MIXQuit);
+CAFE_EXPORT(snd_user, MIXAssignChannel, MIXAssignChannel);
+CAFE_EXPORT(snd_user, MIXReleaseChannel, MIXReleaseChannel);
+CAFE_EXPORT(snd_user, MIXInitInputControl, MIXInitInputControl);
+CAFE_EXPORT(snd_user, MIXUpdateSettings, MIXUpdateSettings);
+CAFE_EXPORT(snd_user, MIXSetDeviceSoundMode, MIXSetDeviceSoundMode);
 
 } // namespace cafe::os

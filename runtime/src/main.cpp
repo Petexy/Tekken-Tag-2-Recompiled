@@ -5,6 +5,7 @@
 #include "cafe/sysmem.h"
 #include "cafe/vfs.h"
 
+#include "host/audio.h"
 #include "host/window.h"
 
 #include <atomic>
@@ -91,7 +92,9 @@ int main(int argc, char** argv) {
     // The window's event loop needs the process's main thread; the title
     // runs beside it. TTT2_GPU=null runs headless.
     const char* gpu = std::getenv("TTT2_GPU");
-    if ((gpu && std::strcmp(gpu, "null") == 0) || !host::open_window("Tekken Tag Tournament 2")) return run();
+    const bool headless = (gpu && std::strcmp(gpu, "null") == 0) || !host::open_window("Tekken Tag Tournament 2");
+    host::open_audio();
+    if (headless) return run();
     std::atomic<bool> finished{false};
     int result = 0;
     std::thread title([&] {
