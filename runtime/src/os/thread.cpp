@@ -6,6 +6,8 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -111,6 +113,10 @@ void finish(Thread* t, uint32_t exit_value) {
 
 void* host_main(void* argument) {
     Thread* t = static_cast<Thread*>(argument);
+    // "OSThread address/core", for debuggers and profilers.
+    char name[16];
+    std::snprintf(name, sizeof(name), "%08X/%d", t->guest, t->core);
+    pthread_setname_np(pthread_self(), name);
     t_current = t;
     set_current_context(&t->ctx);
     uint32_t exit_value;
@@ -243,6 +249,16 @@ int run_main_thread(uint32_t entry, uint32_t argc, uint32_t argv, uint32_t stack
 namespace cafe::os {
 namespace {
 
+// TTT2_TRACE_THREADS=1 logs thread creation and changes to priorities,
+// affinities and names.
+bool trace_threads() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("TTT2_TRACE_THREADS");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return enabled;
+}
+
 GuestAddress OSGetCurrentThread() { return GuestAddress{current_thread()->guest}; }
 
 uint32_t OSGetCoreId() { return static_cast<uint32_t>(current_thread()->core); }
@@ -260,6 +276,10 @@ bool OSCreateThread(GuestAddress thread, uint32_t entry, uint32_t argc, uint32_t
     t->core = core_for(static_cast<uint8_t>(attr), current_thread()->core);
     prepare_context(t, argc, argv);
     g_threads[thread.value] = t;
+    if (trace_threads()) {
+        std::fprintf(stderr, "ttt2: thread 0x%08X created: entry 0x%08X, priority %d, attributes 0x%02X, core %d, "
+                     "by 0x%08X\n", thread.value, entry, priority, attr, t->core, current_thread()->guest);
+    }
     return true;
 }
 
@@ -332,10 +352,15 @@ bool OSIsThreadTerminated(GuestAddress thread) {
 
 void OSSetThreadName(GuestAddress thread, uint32_t name) {
     field<uint32_t>(thread.value, kName) = name;
+    if (trace_threads()) {
+        std::fprintf(stderr, "ttt2: thread 0x%08X is \"%.*s\"\n", thread.value,
+                     static_cast<int>(guest_string(name).size()), guest_string(name).data());
+    }
 }
 
 bool OSSetThreadPriority(GuestAddress thread, int32_t priority) {
     if (priority < 0 || priority > 31) return false;
+    if (trace_threads()) std::fprintf(stderr, "ttt2: thread 0x%08X priority %d\n", thread.value, priority);
     field<int32_t>(thread.value, kBasePriority) = priority;
     field<int32_t>(thread.value, kEffectivePriority) = priority;
     return true;
@@ -346,6 +371,7 @@ int32_t OSGetThreadPriority(GuestAddress thread) {
 }
 
 bool OSSetThreadAffinity(GuestAddress thread, uint32_t affinity) {
+    if (trace_threads()) std::fprintf(stderr, "ttt2: thread 0x%08X affinity 0x%X\n", thread.value, affinity);
     uint8_t& attr = *guest<uint8_t>(thread.value + kAttr);
     attr = static_cast<uint8_t>((attr & ~kAffinityMask) | (affinity & kAffinityMask));
     KernelLock lock(g_kernel);

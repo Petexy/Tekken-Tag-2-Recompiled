@@ -201,17 +201,34 @@ void thunk_default_free(PPCContext& ctx, uint8_t*) { abi::invoke<default_free>(c
 
 // The default-heap entry points are function pointers the game reads from
 // coreinit's data and may replace with its own allocator.
+uint32_t g_alloc_ex_slot = 0;
+uint32_t g_free_slot = 0;
+
 void init_alloc_pointer(uint32_t slot) {
     *guest<be<uint32_t>>(slot) = register_host_function(thunk_default_alloc, "MEMAllocFromDefaultHeap");
 }
 void init_alloc_ex_pointer(uint32_t slot) {
+    g_alloc_ex_slot = slot;
     *guest<be<uint32_t>>(slot) = register_host_function(thunk_default_alloc_ex, "MEMAllocFromDefaultHeapEx");
 }
 void init_free_pointer(uint32_t slot) {
+    g_free_slot = slot;
     *guest<be<uint32_t>>(slot) = register_host_function(thunk_default_free, "MEMFreeToDefaultHeap");
 }
 
 } // namespace
+
+// Allocation from the default heap as other OS libraries do it: through the
+// pointers, so a title's replacement allocator is used.
+uint32_t default_heap_alloc(PPCContext& ctx, uint32_t size, uint32_t alignment) {
+    if (g_alloc_ex_slot == 0) return default_alloc_ex(size, static_cast<int32_t>(alignment));
+    return call_guest(ctx, *guest<be<uint32_t>>(g_alloc_ex_slot), {size, alignment});
+}
+
+void default_heap_free(PPCContext& ctx, uint32_t block) {
+    if (g_free_slot == 0) return default_free(block);
+    call_guest(ctx, *guest<be<uint32_t>>(g_free_slot), {block});
+}
 
 // Base heaps as the OS creates them before the title starts: MEM1 and the
 // foreground bucket as frame heaps, the rest of MEM2 as the default

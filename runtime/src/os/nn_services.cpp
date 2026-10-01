@@ -103,6 +103,12 @@ Result fp_register_account_async(uint32_t, uint32_t) { return kFpOffline; }
 uint32_t fp_result_to_error_code(uint32_t result) { return 1210000 + (result & 0xFFFF); }
 
 // ---------------------------------------------------------------- nn_acp
+// Network time is kept in timer ticks, like OSTime.
+Result ACPConvertNetworkTimeToOSCalendarTime(int64_t time, GuestAddress calendar) {
+    ticks_to_calendar_time(time, calendar.value);
+    return 0;
+}
+
 Result ACPGetNetworkTime(be<int64_t>* time, be<uint32_t>* unknown) {
     if (time) *time = 0;
     if (unknown) *unknown = 0;
@@ -153,5 +159,6 @@ CAFE_EXPORT(nn_fp, RegisterAccountAsync__Q2_2nn2fpFPFQ2_2nn6ResultPv_vPv, fp_reg
 CAFE_EXPORT(nn_fp, ResultToErrorCode__Q2_2nn2fpFQ2_2nn6Result, fp_result_to_error_code);
 
 CAFE_EXPORT(nn_acp, ACPGetNetworkTime, ACPGetNetworkTime);
+CAFE_EXPORT(nn_acp, ACPConvertNetworkTimeToOSCalendarTime, ACPConvertNetworkTimeToOSCalendarTime);
 
 } // namespace cafe::os

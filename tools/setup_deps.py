@@ -17,9 +17,9 @@ def git(directory, *args, capture=False, check=True):
 def main():
     dependencies = json.loads((ROOT / "dependencies.lock.json").read_text())
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("names", nargs="*", help="Default: ZArchive nWiiURecomp; optionally GhidraRPXLoader")
+    parser.add_argument("names", nargs="*", help="Default: ZArchive addrlib nWiiURecomp; optionally GhidraRPXLoader")
     args = parser.parse_args()
-    selected = args.names or ["ZArchive", "nWiiURecomp"]
+    selected = args.names or ["ZArchive", "addrlib", "nWiiURecomp"]
     for name in selected:
         if name not in dependencies:
             parser.error(f"Unknown dependency: {name}")

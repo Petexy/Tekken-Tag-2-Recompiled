@@ -7,6 +7,12 @@
 // sound engine behaves; producing actual output from the voices is a later
 // milestone and plugs into advance_voices().
 //
+// After the frame callbacks, each frame's device output goes through the
+// device final-mix callbacks: 48 kHz planar 32-bit samples, 6 channels for
+// the TV and 4 for each of two GamePads. Titles that mix in software (this
+// one's CRI middleware does) produce their audio there. The buffers are
+// silent until voices are mixed.
+//
 // AXVPB (guest, 0x58 bytes, Cemu's layout): +0x00 index, +0x04 state,
 // +0x1C priority, +0x20 drop callback, +0x24 user data, +0x34 offsets
 // (format u16, loop flag u16, loop/end/current u32, samples pointer).
@@ -52,6 +58,15 @@ uint32_t g_frame_callback = 0;
 uint32_t g_frame_callback2 = 0;
 uint32_t g_aux_callbacks[3][2]{};
 uint32_t g_final_mix_callbacks[2]{};
+
+// AXFINALMIXCBPARAM: +0x00 channel pointer array, +0x04 input channels,
+// +0x06 samples, +0x08 devices, +0x0A output channels (u16 each).
+constexpr uint32_t kOutputSamples = 144; // 3 ms at 48 kHz
+struct FinalMix {
+    uint32_t channels, devices;
+    uint32_t param = 0, pointers = 0, samples = 0;
+};
+FinalMix g_final_mix[2] = {{6, 1}, {4, 2}};
 uint16_t g_master_volume = 0x8000;
 Thread* g_ax_thread = nullptr;
 
@@ -96,6 +111,21 @@ void advance_voices() {
     }
 }
 
+void run_final_mix(Thread* t, int device, uint32_t callback) {
+    const FinalMix& mix = g_final_mix[device];
+    const uint32_t buffers = mix.channels * mix.devices;
+    std::memset(guest<uint8_t>(mix.samples), 0, buffers * kOutputSamples * 4);
+    for (uint32_t c = 0; c < buffers; ++c) {
+        field<uint32_t>(mix.pointers, c * 4) = mix.samples + c * kOutputSamples * 4;
+    }
+    field<uint32_t>(mix.param, 0x00) = mix.pointers;
+    field<uint16_t>(mix.param, 0x04) = static_cast<uint16_t>(mix.channels);
+    field<uint16_t>(mix.param, 0x06) = static_cast<uint16_t>(kOutputSamples);
+    field<uint16_t>(mix.param, 0x08) = static_cast<uint16_t>(mix.devices);
+    field<uint16_t>(mix.param, 0x0A) = static_cast<uint16_t>(mix.channels);
+    call_guest(t->ctx, callback, {mix.param});
+}
+
 void* ax_main(void*) {
     Thread* t = g_ax_thread;
     bind_current_thread(t);
@@ -103,13 +133,15 @@ void* ax_main(void*) {
     for (;;) {
         next += kFramePeriod;
         std::this_thread::sleep_until(next);
-        uint32_t callback, callback2;
+        uint32_t callback, callback2, final_mix[2];
         {
             std::lock_guard lock(g_ax_mutex);
             if (!g_initialized) continue;
             advance_voices();
             callback = g_frame_callback;
             callback2 = g_frame_callback2;
+            final_mix[0] = g_final_mix_callbacks[0];
+            final_mix[1] = g_final_mix_callbacks[1];
         }
         // Frame callbacks run as AX's interrupt handler would.
         KernelLock lock(kernel_mutex());
@@ -120,6 +152,11 @@ void* ax_main(void*) {
         lock.lock();
         bool held = false;
         release_interrupt_lock_for_wait(t, held);
+        lock.unlock();
+        // Final mix callbacks run on AX's own thread, outside the interrupt.
+        for (int device = 0; device < 2; ++device) {
+            if (final_mix[device]) run_final_mix(t, device, final_mix[device]);
+        }
         // Running far behind (debugger, heavy load): skip, don't burst.
         if (std::chrono::steady_clock::now() - next > kFramePeriod * 10) next = std::chrono::steady_clock::now();
     }
@@ -133,6 +170,12 @@ void AXInit() {
         g_voices[i] = Voice{};
         g_voices[i].vpb = system_alloc(kVpbSize, 32);
         field<uint32_t>(g_voices[i].vpb, 0x00) = static_cast<uint32_t>(i);
+    }
+    for (FinalMix& mix : g_final_mix) {
+        const uint32_t buffers = mix.channels * mix.devices;
+        mix.param = system_alloc(0x10, 32);
+        mix.pointers = system_alloc(buffers * 4, 32);
+        mix.samples = system_alloc(buffers * kOutputSamples * 4, 64);
     }
     g_initialized = true;
     g_ax_thread = create_internal_thread("cafe audio", 0);
@@ -248,6 +291,12 @@ int32_t AXSetVoiceSrcRatio(uint32_t vpb, float ratio) {
     return 0;
 }
 
+// AXPBSRC: 16.16 resampling ratio, then fraction and filter history.
+void AXSetVoiceSrc(uint32_t vpb, const be<uint16_t>* src) {
+    std::lock_guard lock(g_ax_mutex);
+    if (Voice* v = voice_of(vpb); v != nullptr && src != nullptr) v->ratio = (uint32_t{src[0]} << 16) | src[1];
+}
+
 // AXPBADPCMLOOP and the ADPCM decoder state matter only for mixing.
 void AXSetVoiceAdpcm(uint32_t, uint32_t) {}
 void AXSetVoiceAdpcmLoop(uint32_t, uint32_t) {}
@@ -301,6 +350,7 @@ uint32_t AXRegisterAuxBCallback(uint32_t callback, uint32_t context) { return au
 uint32_t AXRegisterAuxCCallback(uint32_t callback, uint32_t context) { return aux_register(2, callback, context); }
 int32_t AXRegisterDeviceFinalMixCallback(uint32_t device, uint32_t callback) {
     if (device > 1) return -1;
+    std::lock_guard lock(g_ax_mutex);
     g_final_mix_callbacks[device] = callback;
     return 0;
 }
@@ -330,6 +380,7 @@ CAFE_EXPORT(snd_core, AXSetVoiceOffsets, AXSetVoiceOffsets);
 CAFE_EXPORT(snd_core, AXGetVoiceOffsets, AXGetVoiceOffsets);
 CAFE_EXPORT(snd_core, AXCheckVoiceOffsets, AXCheckVoiceOffsets);
 CAFE_EXPORT(snd_core, AXSetVoiceSrcRatio, AXSetVoiceSrcRatio);
+CAFE_EXPORT(snd_core, AXSetVoiceSrc, AXSetVoiceSrc);
 CAFE_EXPORT(snd_core, AXSetVoiceAdpcm, AXSetVoiceAdpcm);
 CAFE_EXPORT(snd_core, AXSetVoiceAdpcmLoop, AXSetVoiceAdpcmLoop);
 CAFE_EXPORT(snd_core, AXSetVoiceSrcType, AXSetVoiceSrcType);

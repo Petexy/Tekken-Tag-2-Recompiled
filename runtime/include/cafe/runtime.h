@@ -41,6 +41,8 @@ void build_dispatch_table();
 // Gives a native function a guest-visible address (for function pointers the
 // guest stores and calls, e.g. MEMAllocFromDefaultHeap's value).
 uint32_t register_host_function(PPCFunc* function, const char* name);
+// The name a host function was registered with, or null for other addresses.
+const char* host_function_name(uint32_t address);
 
 // ---------------------------------------------------------------- errors
 // The context of the guest thread running on this host thread, if any.

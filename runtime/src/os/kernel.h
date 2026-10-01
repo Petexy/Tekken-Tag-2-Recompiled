@@ -92,6 +92,14 @@ void acquire_interrupt_lock(KernelLock& lock, Thread* self);
 void release_interrupt_lock_for_wait(Thread* self, bool& was_held);
 void reacquire_interrupt_lock_after_wait(KernelLock& lock, Thread* self, bool was_held);
 
+// OSTicksToCalendarTime into the OSCalendarTime at `calendar`.
+void ticks_to_calendar_time(int64_t ticks, uint32_t calendar);
+
+// The default heap, allocated through the MEMAllocFromDefaultHeapEx /
+// MEMFreeToDefaultHeap pointers the title may have replaced.
+uint32_t default_heap_alloc(PPCContext& ctx, uint32_t size, uint32_t alignment);
+void default_heap_free(PPCContext& ctx, uint32_t block);
+
 // Starts the game's main thread running `entry` and waits for the process to
 // exit; returns the exit code.
 int run_main_thread(uint32_t entry, uint32_t argc, uint32_t argv, uint32_t stack_size,

@@ -7,6 +7,20 @@ endif()
 
 add_subdirectory(third_party/ZArchive EXCLUDE_FROM_ALL)
 
+# AMD's surface address library (MIT), in its R600 variant for the Wii U GPU:
+# GX2 surface layouts must match the console's exactly.
+set(ADDRLIB_DIR ${CMAKE_SOURCE_DIR}/third_party/addrlib)
+add_library(amd_addrlib STATIC EXCLUDE_FROM_ALL
+    ${ADDRLIB_DIR}/src/addrinterface.cpp
+    ${ADDRLIB_DIR}/src/core/addrelemlib.cpp
+    ${ADDRLIB_DIR}/src/core/addrlib.cpp
+    ${ADDRLIB_DIR}/src/core/addrobject.cpp
+    ${ADDRLIB_DIR}/src/r600/r600addrlib.cpp)
+target_include_directories(amd_addrlib SYSTEM PUBLIC ${ADDRLIB_DIR}/include)
+target_include_directories(amd_addrlib PRIVATE ${ADDRLIB_DIR}/src)
+target_compile_features(amd_addrlib PRIVATE cxx_std_17)
+target_compile_options(amd_addrlib PRIVATE -w)
+
 add_executable(wua_extract tools/wua_extract.cpp)
 target_compile_features(wua_extract PRIVATE cxx_std_20)
 target_link_libraries(wua_extract PRIVATE ZArchive::zarchive)

@@ -84,3 +84,11 @@ if(EXISTS "${DOLPHIN_CORE}/Core/PowerPC/Interpreter/Interpreter_Tables.cpp"
 else()
     message(STATUS "semantics_test disabled: needs third_party/ref/dolphin, fmt and TTT2_RPX")
 endif()
+
+# Guest polling loops must see other threads' stores (no Dolphin needed).
+add_executable(memory_model_test memory_model_test.cpp)
+target_include_directories(memory_model_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include)
+target_compile_features(memory_model_test PRIVATE cxx_std_20)
+# The flags the port compiles generated code with.
+target_compile_options(memory_model_test PRIVATE -O2 -march=x86-64-v3 -Wno-unused-label)
+add_test(NAME memory_model_test COMMAND memory_model_test)

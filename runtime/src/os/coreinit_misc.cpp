@@ -378,6 +378,10 @@ bool OSSavesDone_ReadyToRelease() { return true; }
 
 } // namespace
 
+void ticks_to_calendar_time(int64_t ticks, uint32_t calendar) {
+    OSTicksToCalendarTime(ticks, guest<CalendarTime>(calendar));
+}
+
 void set_mem2_bounds(uint32_t begin, uint32_t end) {
     g_mem2_begin = begin;
     g_mem2_end = end;

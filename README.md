@@ -37,21 +37,31 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
 
 ## Current results
 
-- **The game boots natively through all of its system initialisation**,
-  reading `Tekken.rpx` and assets straight from the `.wua`, and stops at the
-  first graphics call, `GX2Init`. `cafe-recomp` turns the reachable 79,564
-  functions (6.03M instructions) into 257 C++ files in ~2 s; clang builds
-  them with the runtime into a 132 MB x86-64 `ttt2` in ~4 minutes.
+- **The game runs natively into its main loop**, reading `Tekken.rpx` and
+  assets straight from the `.wua`: a steady 59.9 frames/s (vsync-paced),
+  10-15 draws per frame, with no window yet (the GPU backend renders
+  nothing). Every function the game imports statically is implemented.
+  `cafe-recomp` turns the reachable 79,564 functions (6.03M instructions)
+  into 257 C++ files in ~2 s; clang builds them with the runtime into a
+  132 MB x86-64 `ttt2` in ~4 minutes.
 - The native Cafe OS layer (`runtime/src/os/`) covers threads and
   synchronisation, heaps, filesystem and saves, system services, ProcUI,
-  input, the AX voice model (no sound output yet) and an offline network.
+  input, the AX voice model and final-mix stage (no sound output yet), DMA,
+  the software keyboard and error viewer (no UI yet) and an offline network.
+- GX2 (`runtime/src/gx2/`) is implemented natively and writes real PM4
+  command buffers; a command processor (`runtime/src/gpu/`) executes them,
+  with surface layouts from AMD's address library. See
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#gx2-and-the-gpu).
+- Guest memory accesses are volatile, so guest threads that poll memory see
+  each other's stores (`build/tests/memory_model_test`).
 - Every non-control-flow instruction variant the game uses matches Dolphin's
   hardware-verified interpreter bit for bit (6,753 encodings x 300 random
   states, 0 mismatches; `build/tests/semantics_test`).
 - `cafe-census` facts (205,140 functions from the symbol table, 0 undecodable
   words, 20.3% reachable) are in
   [`analysis/instruction-census.txt`](analysis/instruction-census.txt).
-- Not done: graphics (GX2 -> Vulkan), sound output, gameplay.
+- Not done: rendering (Vulkan backend, Latte shader translation), sound
+  output, input from host devices, gameplay.
 
 Earlier evaluation of existing recompilers is in
 [`analysis/recompiler-assessment.md`](analysis/recompiler-assessment.md).
@@ -144,11 +154,13 @@ build-port/ttt2 "/path/to/TEKKEN TAG 2 Wii U EDITION (EU).wua"
 The semantics test needs the Dolphin reference checkout in
 `third_party/ref/dolphin` and `fmt`:
 `cmake --build build --target semantics_test && build/tests/semantics_test`.
+`build/tests/memory_model_test` needs nothing extra.
 
 ## Next engineering milestones
 
 See the milestone table in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-Next: GX2 (null backend to reach the main loop, then Vulkan) - M2/M3.
+Next: M3, a Vulkan backend for the command processor (render targets,
+textures with detiling, Latte shader to SPIR-V translation) and a window.
 
 ## Local data and checks
 

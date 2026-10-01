@@ -8,6 +8,7 @@
 #include "cafe/sysmem.h"
 
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 
@@ -20,6 +21,15 @@ std::map<uint32_t, std::string> g_modules;           // handle -> library name
 std::map<std::string, uint32_t> g_function_thunks;    // "module:name" -> guest address
 std::map<std::string, uint32_t> g_data_objects;
 uint32_t g_next_handle = 0x7D000000; // handles are opaque to the title
+
+// Unimplemented library functions still get an address, so titles that
+// look up more than they use keep running; calling one stops with its name.
+// Titles call these pointers with bctrl, so CTR holds the address called.
+void unimplemented_dynamic_export(PPCContext& ctx, uint8_t*) {
+    const char* name = host_function_name(ctx.ctr);
+    fatal("the game called %s (found with OSDynLoad), which the runtime does not implement yet",
+          name ? name : "a library function");
+}
 
 uint32_t OSDynLoad_Acquire(uint32_t name, be<uint32_t>* handle) {
     KernelLock lock(kernel_mutex());
@@ -62,11 +72,14 @@ uint32_t OSDynLoad_FindExport(uint32_t handle, uint32_t is_data, uint32_t name, 
     auto it = g_function_thunks.find(key);
     if (it == g_function_thunks.end()) {
         const Export* e = find_export(module->second, symbol);
-        if (e == nullptr) {
-            std::fprintf(stderr, "ttt2: OSDynLoad: %s is not implemented\n", key.c_str());
-            return kError;
+        uint32_t thunk;
+        if (e != nullptr) {
+            thunk = register_host_function(e->function, e->name);
+        } else {
+            std::fprintf(stderr, "ttt2: OSDynLoad: %s is not implemented (stops if called)\n", key.c_str());
+            thunk = register_host_function(unimplemented_dynamic_export, strdup(key.c_str()));
         }
-        it = g_function_thunks.emplace(key, register_host_function(e->function, e->name)).first;
+        it = g_function_thunks.emplace(key, thunk).first;
     }
     if (address) *address = it->second;
     return 0;

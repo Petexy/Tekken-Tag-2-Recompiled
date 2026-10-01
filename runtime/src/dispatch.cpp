@@ -74,6 +74,12 @@ uint32_t register_host_function(PPCFunc* function, const char* name) {
     return address;
 }
 
+const char* host_function_name(uint32_t address) {
+    std::lock_guard lock(g_host_mutex);
+    if (address < layout::kHostThunkBase || address >= g_next_host_thunk || (address & 3) != 0) return nullptr;
+    return g_host_names[(address - layout::kHostThunkBase) / 4].c_str();
+}
+
 } // namespace cafe
 
 extern "C" cafe::PPCFunc* cafe_ppc_lookup(uint32_t address) {

@@ -80,55 +80,40 @@ namespace cafe::ppc {
 
 // ---------------------------------------------------------------------------
 // Guest memory: `base` maps the 32-bit guest space; data is big-endian.
-inline uint8_t ld8(const uint8_t* base, uint32_t ea) { return base[ea]; }
-inline uint16_t ld16(const uint8_t* base, uint32_t ea) {
-    uint16_t v;
-    std::memcpy(&v, base + ea, 2);
-    return __builtin_bswap16(v);
-}
-inline uint32_t ld32(const uint8_t* base, uint32_t ea) {
-    uint32_t v;
-    std::memcpy(&v, base + ea, 4);
-    return __builtin_bswap32(v);
-}
-inline uint64_t ld64(const uint8_t* base, uint32_t ea) {
-    uint64_t v;
-    std::memcpy(&v, base + ea, 8);
-    return __builtin_bswap64(v);
-}
-inline void st8(uint8_t* base, uint32_t ea, uint8_t v) { base[ea] = v; }
-inline void st16(uint8_t* base, uint32_t ea, uint16_t v) {
-    v = __builtin_bswap16(v);
-    std::memcpy(base + ea, &v, 2);
-}
-inline void st32(uint8_t* base, uint32_t ea, uint32_t v) {
-    v = __builtin_bswap32(v);
-    std::memcpy(base + ea, &v, 4);
-}
-inline void st64(uint8_t* base, uint32_t ea, uint64_t v) {
-    v = __builtin_bswap64(v);
-    std::memcpy(base + ea, &v, 8);
-}
+//
+// Guest memory is shared between guest threads (and with the runtime and the
+// GPU), so every access is volatile: the compiler performs each load and
+// store the guest program performs, in program order, and cannot cache
+// memory in registers. Without this a guest loop polling a flag that
+// another thread sets compiles to a single read. x86 performs the unaligned
+// accesses natively.
+namespace mem {
+using u16 = uint16_t __attribute__((aligned(1), may_alias));
+using u32 = uint32_t __attribute__((aligned(1), may_alias));
+using u64 = uint64_t __attribute__((aligned(1), may_alias));
+template <typename T>
+inline T load(const uint8_t* p) { return *reinterpret_cast<const volatile T*>(p); }
+template <typename T, typename V>
+inline void store(uint8_t* p, V v) { *reinterpret_cast<volatile T*>(p) = v; }
+} // namespace mem
+
+inline uint8_t ld8(const uint8_t* base, uint32_t ea) { return mem::load<uint8_t>(base + ea); }
+inline uint16_t ld16(const uint8_t* base, uint32_t ea) { return __builtin_bswap16(mem::load<mem::u16>(base + ea)); }
+inline uint32_t ld32(const uint8_t* base, uint32_t ea) { return __builtin_bswap32(mem::load<mem::u32>(base + ea)); }
+inline uint64_t ld64(const uint8_t* base, uint32_t ea) { return __builtin_bswap64(mem::load<mem::u64>(base + ea)); }
+inline void st8(uint8_t* base, uint32_t ea, uint8_t v) { mem::store<uint8_t>(base + ea, v); }
+inline void st16(uint8_t* base, uint32_t ea, uint16_t v) { mem::store<mem::u16>(base + ea, __builtin_bswap16(v)); }
+inline void st32(uint8_t* base, uint32_t ea, uint32_t v) { mem::store<mem::u32>(base + ea, __builtin_bswap32(v)); }
+inline void st64(uint8_t* base, uint32_t ea, uint64_t v) { mem::store<mem::u64>(base + ea, __builtin_bswap64(v)); }
 // Byte-reversed forms (lhbrx/lwbrx/...) read the guest bytes little-endian.
-inline uint16_t ld16_le(const uint8_t* base, uint32_t ea) {
-    uint16_t v;
-    std::memcpy(&v, base + ea, 2);
-    return v;
-}
-inline uint32_t ld32_le(const uint8_t* base, uint32_t ea) {
-    uint32_t v;
-    std::memcpy(&v, base + ea, 4);
-    return v;
-}
-inline void st16_le(uint8_t* base, uint32_t ea, uint16_t v) {
-    std::memcpy(base + ea, &v, 2);
-}
-inline void st32_le(uint8_t* base, uint32_t ea, uint32_t v) {
-    std::memcpy(base + ea, &v, 4);
-}
+inline uint16_t ld16_le(const uint8_t* base, uint32_t ea) { return mem::load<mem::u16>(base + ea); }
+inline uint32_t ld32_le(const uint8_t* base, uint32_t ea) { return mem::load<mem::u32>(base + ea); }
+inline void st16_le(uint8_t* base, uint32_t ea, uint16_t v) { mem::store<mem::u16>(base + ea, v); }
+inline void st32_le(uint8_t* base, uint32_t ea, uint32_t v) { mem::store<mem::u32>(base + ea, v); }
 
 inline void dcbz(uint8_t* base, uint32_t ea) {
-    std::memset(base + (ea & ~31u), 0, 32);
+    uint8_t* line = base + (ea & ~31u);
+    for (int i = 0; i < 32; i += 8) mem::store<mem::u64>(line + i, uint64_t{0});
 }
 
 inline void lmw(PPCContext& ctx, const uint8_t* base, uint32_t rd, uint32_t ea) {
