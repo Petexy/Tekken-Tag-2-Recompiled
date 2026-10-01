@@ -2,8 +2,8 @@
 
 This workspace is a **static recompilation** project for the user's European
 Wii U dump. The target is a native x86-64 program; generated C/C++ is acceptable.
-The native executable boots, renders the intro, title screen, menus and
-attract-mode fights in a window; sound and gameplay are not done yet.
+The native executable boots in about a second and plays in a window with
+sound: intro, menus, character select and arcade matches, with saves.
 
 ## Verified input
 
@@ -38,10 +38,13 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
 
 ## Current results
 
-- **The game renders natively in a window**: the intro movie, logos,
-  title screen, attract-mode demo fights (stages, characters, effects,
-  subtitles), the main menu and character select, at ~58 frames/s on an
-  RX 9060 XT, reading `Tekken.rpx` and assets straight from the `.wua`.
+- **The game runs natively in a window, with sound**: the intro movie,
+  logos, title screen, attract-mode demo fights, the menus, character
+  select and arcade matches (both rounds, K.O., continue, game over) at
+  ~58 frames/s on an RX 9060 XT, reading `Tekken.rpx` and assets straight
+  from the `.wua`. Progress is saved and survives a restart. Matches were
+  played with scripted input (`TTT2_INPUT_SCRIPT`); keyboard and gamepad
+  play by hand is still to be confirmed.
   Every function the game imports statically is implemented.
   `cafe-recomp` turns the reachable 79,564 functions (6.03M instructions)
   into 257 C++ files in ~2 s; clang builds them with the runtime into a
@@ -53,8 +56,10 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#vulkan-renderer).
 - The native Cafe OS layer (`runtime/src/os/`) covers threads and
   synchronisation, heaps, filesystem and saves, system services, ProcUI,
-  input, the AX voice model and final-mix stage (no sound output yet), DMA,
-  the software keyboard and error viewer (no UI yet) and an offline network.
+  input, AX voice mixing with SDL3 output and the MIX library, DMA, the
+  software keyboard and error viewer (no UI yet) and an offline network.
+  Blocked threads wake per object (wait channels), which took the boot
+  loading screen from ~17 s to ~1 s.
 - GX2 (`runtime/src/gx2/`) is implemented natively and writes real PM4
   command buffers; a command processor (`runtime/src/gpu/`) executes them,
   with surface layouts from AMD's address library. See
@@ -67,9 +72,10 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
 - `cafe-census` facts (205,140 functions from the symbol table, 0 undecodable
   words, 20.3% reachable) are in
   [`analysis/instruction-census.txt`](analysis/instruction-census.txt).
-- Not done: sound output, confirming character selection with input (the
-  menus navigate), gameplay, MSAA, a first-boot black screen of ~16 s
-  (not yet checked against the console).
+- Not done: hand-played confirmation with a real controller, GamePad
+  screen output and GamePad speaker audio, AXFX effects and voice filters
+  (unused by this title's sound so far), software keyboard and error viewer
+  UI, online play. The title uses no MSAA.
 
 Earlier evaluation of existing recompilers is in
 [`analysis/recompiler-assessment.md`](analysis/recompiler-assessment.md).
@@ -172,8 +178,8 @@ The semantics test needs the Dolphin reference checkout in
 ## Next engineering milestones
 
 See the milestone table in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-Next: M4, input (character select does not confirm yet), audio output
-through SDL3, saves; then M5, an offline match.
+Next: confirm M5 by hand (an offline match with keyboard or gamepad), then
+M6: all stages and characters, long runs, performance.
 
 ## Local data and checks
 

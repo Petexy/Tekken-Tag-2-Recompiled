@@ -73,12 +73,24 @@ Implemented in host C++, no guest-code interpretation:
    and hands to a rendering backend: Vulkan, or null for headless runs.
    Latte shaders the game ships are translated to GLSL and compiled to
    SPIR-V at run time; tiled surfaces are detiled.
-3. **snd_core / snd_user → host audio** (SDL3).
+3. **snd_core / snd_user → host audio**: AX voices mixed natively and
+   played through SDL3 (see the audio section below).
 4. **vpad / padscore → SDL3 gamepad**.
 5. **nsysnet / nlibcurl / nn_\***: offline stubs.
 
 Cemu, decaf-emu and nWiiURecomp are references and test oracles only; nothing
 from them ships in the port.
+
+Guest threads are host threads; every kernel object is examined and changed
+under one kernel lock. A blocked thread sleeps on a *wait channel* keyed by
+the object it waits for (a mutex, condition, semaphore, event, message
+queue, thread queue or thread, by guest address; or the interrupt lock,
+display, GPU, alarm schedule), and waking an object notifies only its
+channel. With one shared condition variable every mutex unlock and every
+OSRestoreInterrupts woke all ~40 of the title's blocked threads: the title's
+allocator locks a mutex per allocation, and the boot-time loading screen
+took ~17 s of herd wake-ups for 0.9 s of work (now ~1 s; CPU use fell from
+~5 cores to a quarter of one).
 
 System libraries the title loads with OSDynLoad are implemented the same
 way: `swkbd` (software keyboard) and `erreula` (error viewer) have no UI
@@ -124,10 +136,36 @@ command processor thread (runtime/src/gpu/) ── Latte register file
   CPU wrote memory (`gpu::cpu_wrote`); SURFACE_SYNC packets are GPU cache
   operations only. The title flushes the whole texture cache several times
   a frame, which says nothing about what changed.
-- Audio: each 3 ms AX frame runs the frame callbacks, then the device
-  final-mix callbacks with 48 kHz planar buffers (TV 6 channels, GamePad
-  4 x 2). The title's CRI middleware mixes in software and drives its
-  engine from these callbacks; output is silent until voices are mixed.
+- A texture over a render target of a different format with the same
+  element size is copied from it, reinterpreted: the title compresses
+  textures on the GPU by rendering each 4x4 block as one texel (BC1 over
+  R16G16B16A16, BC3 over R32G32B32A32_UINT) and samples the memory as BC1
+  or BC3, every mip level from its own target.
+- The title never uses multisampled render targets and never issues a
+  stream-out "draw opaque" (it does not import GX2DrawStreamOut); neither
+  is implemented.
+
+### Audio
+
+Every 3 ms AX frame (`runtime/src/os/ax.cpp`) mixes each playing voice,
+runs the title's frame callbacks, passes each device's output through the
+device final-mix callbacks (48 kHz planar 32-bit buffers in 16-bit range:
+TV 6 channels, GamePad 4 x 2) and plays the TV's channels 0-1 as stereo
+(`runtime/src/host/audio.cpp`, SDL3). A voice reads PCM16, PCM8 or
+DSP-ADPCM from guest memory at its 16.16 rate ratio (relative to AX's
+32 kHz renderer), linearly interpolated, scaled by its volume envelope and
+mixed into each device channel by its device mix; volumes ramp by their
+per-sample deltas. The frame clock follows the playback device: a frame is
+produced when less than 30 ms of output is queued, so the title makes sound
+exactly as fast as it is played (falling back to the 3 ms clock if the
+device stops consuming, or without a device).
+
+The title's CRI ADX2 middleware decodes and mixes in software and outputs
+5.1 at 44.1 kHz through six looping PCM16 voices of 2,880 samples; their
+device mixes fold them to TV stereo, and their volume envelopes come from
+the MIX library (`snd_user.cpp`: input levels in 0.1 dB, ramped over one
+frame). No voice sends to the aux (effect) buses, so AXFX effects are
+never run; filters are accepted and not applied.
 
 ### Latte shaders
 
@@ -192,7 +230,14 @@ backtrace. Iterating on the runtime rebuilds and relinks in ~2 s.
 The window shows the TV image (F11 toggles fullscreen). Keyboard: arrows
 D-pad, X/Z/S/A the A/B/X/Y buttons, Q/W L/R, 1/2 ZL/ZR, Enter +, Backspace
 −, H Home, I/J/K/L the left stick; SDL gamepads map by button position.
-`TTT2_GPU=null` runs headless without a window.
+`TTT2_GPU=null` runs headless without a window. Sound plays on the
+default output device; `TTT2_AUDIO=0` disables it.
+
+Unattended runs press buttons with `TTT2_INPUT_SCRIPT`. From a cold start
+this reaches an arcade match (solo, Heihachi) at about 72 s; append
+presses such as `,72:y,73:x,...` to fight:
+`TTT2_INPUT_SCRIPT="8:plus,21:plus,24:plus,31:a,37:a,41:right,42:right,43:right,45:a,49:right,50:right,53:a,57:a"`.
+Character select refuses a character already picked for the team.
 
 Debugging: every guest function is a native function (`sub_XXXXXXXX_orig`),
 so gdb breakpoints, watchpoints and backtraces work on guest code directly;
@@ -212,6 +257,9 @@ per frame every ten seconds. Renderer debugging:
 | `TTT2_TRACE_TARGETS=1`, `TTT2_WATCH=<hex address>` | render target creation; writes and loads touching an address |
 | `TTT2_CHECK_TILING=1` | compare fast detiling with addrlib per element |
 | `TTT2_VK_VALIDATION=1` | Khronos validation layer, if installed |
+| `TTT2_AUDIO_DUMP=<file.wav>` | everything played, as 48 kHz stereo WAV (also without a device) |
+| `TTT2_TRACE_AX=1` | voice set-up, device mixes, output level |
+| `TTT2_TRACE_FS=1` | file and save opens, reads and writes, with times |
 
 ## Verification
 
@@ -255,6 +303,6 @@ per frame every ten seconds. Renderer debugging:
 | M1 | Code generator for the full ISA | Done 2026-10-01: all 205,200 entries compile (`--all`, 14 min); semantics and control-flow tests pass with 0 mismatches |
 | M2 | Runtime core, boot | Done 2026-10-01: the game runs its main loop at a steady 59.9 frames/s (vsync-paced) on the null GPU backend, every static import implemented |
 | M3 | GX2 → Vulkan | Done 2026-10-01: intro movie, logos, title screen, attract-mode fights, main menu and character select render correctly at ~58 frames/s |
-| M4 | Input, audio, filesystem, saves | Menus navigable with sound |
-| M5 | Gameplay | Offline match playable start to finish |
+| M4 | Input, audio, filesystem, saves | Done 2026-10-02: menus and character select navigate, sound plays (checked from WAV dumps: content, levels, no buffer underruns), saves load and persist (the battle record survives a restart) |
+| M5 | Gameplay | Reached with scripted input 2026-10-02: an arcade match from character select through both rounds, K.O., continue and game over, back to the menu with the record updated. To confirm by hand with a keyboard or gamepad |
 | M6 | Hardening | All stages/characters, long runs, performance |
