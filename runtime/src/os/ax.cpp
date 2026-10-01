@@ -46,8 +46,6 @@ constexpr uint32_t kVpbSize = 0x58;
 constexpr uint32_t kRendererSamples = 96; // 3 ms at the 32 kHz renderer
 constexpr uint32_t kOutputSamples = 144;  // 3 ms at 48 kHz
 constexpr auto kFramePeriod = std::chrono::microseconds(3000);
-// Output queued ahead of the device: enough to ride out scheduling jitter.
-constexpr uint32_t kQueueTarget = 1440; // 30 ms
 constexpr int kTvChannels = 6, kDrcChannels = 4, kBuses = 4;
 enum Format : uint16_t { kAdpcm = 0x00, kPcm16 = 0x0A, kPcm8 = 0x19 };
 
@@ -280,18 +278,33 @@ void run_final_mix(Thread* t, int device, uint32_t callback, float* out) {
     }
 }
 
-// Waits for the next frame: on the device's demand when sound is played,
-// otherwise every 3 ms by the clock. A device that stops consuming does not
-// stop the title's sound engine: after 50 ms the frame runs anyway.
+// Waits for the next frame. Frames come every 3 ms, as on the console: the
+// title's sound engine fills its voices from its own threads and expects AX
+// to consume them at that pace (frames run in bursts, at the device's
+// demand, read audio it has not written yet: half the output was silence).
+// With a device, the period is nudged by at most 0.5% to keep the output
+// queued ahead of the device near its target, following the device's clock
+// (real drift needs a few hundredths of a percent; no audible pitch change).
 void wait_for_frame(std::chrono::steady_clock::time_point& next) {
+    std::chrono::duration<double, std::micro> period = kFramePeriod;
     if (host::audio_device_active()) {
-        const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-        while (host::queued_audio_frames() > kQueueTarget && std::chrono::steady_clock::now() < give_up) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        static double level = host::kAudioQueueTarget; // smoothed over ~0.3 s
+        const uint32_t queued = host::queued_audio_frames();
+        level += (queued - level) * 0.01;
+        const double error = (level - host::kAudioQueueTarget) / host::kAudioQueueTarget;
+        period *= 1.0 + std::clamp(error * 0.02, -0.005, 0.005);
+        if (g_trace) {
+            static uint32_t lowest = UINT32_MAX, frames = 0;
+            lowest = std::min(lowest, queued);
+            if (++frames == 333) {
+                AX_TRACE("queue: average %.0f, lowest %u frames; period %+.3f%%\n", level, lowest,
+                         (period / kFramePeriod - 1.0) * 100.0);
+                lowest = UINT32_MAX;
+                frames = 0;
+            }
         }
-        return;
     }
-    next += kFramePeriod;
+    next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
     std::this_thread::sleep_until(next);
     // Running far behind (debugger, heavy load): skip, don't burst.
     if (std::chrono::steady_clock::now() - next > kFramePeriod * 10) next = std::chrono::steady_clock::now();

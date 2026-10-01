@@ -155,10 +155,13 @@ TV 6 channels, GamePad 4 x 2) and plays the TV's channels 0-1 as stereo
 DSP-ADPCM from guest memory at its 16.16 rate ratio (relative to AX's
 32 kHz renderer), linearly interpolated, scaled by its volume envelope and
 mixed into each device channel by its device mix; volumes ramp by their
-per-sample deltas. The frame clock follows the playback device: a frame is
-produced when less than 30 ms of output is queued, so the title makes sound
-exactly as fast as it is played (falling back to the 3 ms clock if the
-device stops consuming, or without a device).
+per-sample deltas. Frames are steady 3 ms ticks, as on the console: the
+title's sound engine fills its voices from its own threads, and frames run
+in bursts at the device's demand read audio it has not written yet (that
+silenced half of the output after the intro). With a device the tick is
+nudged by at most 0.5% to keep ~2048 frames queued, following the device's
+clock (in practice by a few hundredths of a percent); if the queue runs dry
+(start-up, a stall) silence refills it at once.
 
 The title's CRI ADX2 middleware decodes and mixes in software and outputs
 5.1 at 44.1 kHz through six looping PCM16 voices of 2,880 samples; their
@@ -238,7 +241,8 @@ The window shows the TV image (F11 toggles fullscreen). Keyboard: arrows
 D-pad, X/Z/S/A the A/B/X/Y buttons, Q/W L/R, 1/2 ZL/ZR, Enter +, Backspace
 −, H Home, I/J/K/L the left stick; SDL gamepads map by button position.
 `TTT2_GPU=null` runs headless without a window. Sound plays on the
-default output device; `TTT2_AUDIO=0` disables it.
+default output device; `TTT2_AUDIO=0` disables it and
+`TTT2_AUDIO_VOLUME=<percent>` scales it.
 
 Unattended runs press buttons with `TTT2_INPUT_SCRIPT`. From a cold start
 this reaches an arcade match (solo, Heihachi) at about 72 s; append

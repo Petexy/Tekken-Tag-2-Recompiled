@@ -12,6 +12,7 @@ namespace cafe::host {
 namespace {
 
 SDL_AudioStream* g_stream = nullptr;
+float g_volume = 1.0f; // TTT2_AUDIO_VOLUME, percent
 
 // TTT2_AUDIO_DUMP: 16-bit stereo WAV; the header's sizes are rewritten
 // every second so a run that is killed still leaves a valid file.
@@ -71,6 +72,9 @@ void open_audio() {
         if (g_dump) write_wav_header();
         else std::fprintf(stderr, "ttt2: audio: cannot write %s\n", path);
     }
+    if (const char* volume = std::getenv("TTT2_AUDIO_VOLUME")) {
+        g_volume = std::clamp(static_cast<float>(std::atof(volume)) / 100.0f, 0.0f, 1.0f);
+    }
     if (const char* setting = std::getenv("TTT2_AUDIO"); setting && std::strcmp(setting, "0") == 0) return;
     // Without a window there is no event loop to act on SDL's quit event:
     // leave SIGINT/SIGTERM to their default action.
@@ -94,8 +98,26 @@ bool audio_device_active() { return g_stream != nullptr; }
 void queue_audio(const float* frames, uint32_t count) {
     if (g_stream) {
         // A stalled device: drop the backlog rather than let it grow.
-        if (queued_audio_frames() > kAudioRate / 4) SDL_ClearAudioStream(g_stream);
-        SDL_PutAudioStreamData(g_stream, frames, static_cast<int>(count * 2 * sizeof(float)));
+        const uint32_t queued = queued_audio_frames();
+        if (queued > kAudioRate / 4) {
+            std::fprintf(stderr, "ttt2: audio: output backlog over 250 ms, dropped\n");
+            SDL_ClearAudioStream(g_stream);
+        } else if (queued < count) {
+            // About to run dry: refill to the target with silence.
+            static const float silence[2 * kAudioQueueTarget] = {};
+            SDL_PutAudioStreamData(g_stream, silence, static_cast<int>((kAudioQueueTarget - queued) * 2 * sizeof(float)));
+        }
+        if (g_volume == 1.0f) {
+            SDL_PutAudioStreamData(g_stream, frames, static_cast<int>(count * 2 * sizeof(float)));
+        } else {
+            float scaled[2 * 512];
+            for (uint32_t done = 0; done < count;) {
+                const uint32_t n = std::min<uint32_t>(count - done, 512);
+                for (uint32_t i = 0; i < 2 * n; ++i) scaled[i] = frames[2 * done + i] * g_volume;
+                SDL_PutAudioStreamData(g_stream, scaled, static_cast<int>(n * 2 * sizeof(float)));
+                done += n;
+            }
+        }
     }
     if (g_dump) dump(frames, count);
 }
