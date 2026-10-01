@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 namespace cafe::gpu::vk {
 namespace {
@@ -190,6 +191,66 @@ void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t wid
     barrier();
 }
 
+// Render targets holding a texture's levels: written by the GPU after the
+// CPU last wrote that memory, with elements of the texture's size. Elements
+// are texels, or 4x4 blocks of a compressed texture: the title compresses
+// textures on the GPU by rendering each block as one 64- or 128-bit texel
+// (BC1 over R16G16B16A16, BC3 over R32G32B32A32), and the console reads the
+// same memory either way. Returns false when level 0 has no such target.
+bool Renderer::load_texture_from_targets(Texture& t) {
+    const Resource r = decode(t.words.data());
+    const FormatInfo f = color_format(r.format);
+    const gx2::Surface s = surface_of(r);
+    const uint32_t levels = std::min(r.last_level + 1, 14u);
+    const Target* sources[14] = {};
+    uint64_t newest = 0;
+    for (uint32_t level = 0; level < levels; ++level) {
+        uint32_t address = level == 0 ? uint32_t{s.image}
+                                      : s.mipmaps + (level > 1 ? uint32_t{s.mip_level_offset[level - 1]} : 0u);
+        if (gx2::is_macro_tiled(r.tile_mode)) address &= ~0x700u;
+        const Target* src = find_target(address, 0, false);
+        if (src == nullptr || src->written <= src->overwritten) {
+            if (level == 0) return false;
+            continue;
+        }
+        if (color_format(src->format).bytes != f.bytes) {
+            static std::set<uint64_t> reported;
+            if (reported.insert(uint64_t{address} << 32 | r.format << 12 | src->format).second) {
+                std::fprintf(stderr,
+                             "ttt2: gpu: texture 0x%08X level %u (fmt 0x%03X, %ux%u) over a render target of format "
+                             "0x%03X\n",
+                             address, level, r.format, r.width, r.height, src->format);
+            }
+            if (level == 0) return false;
+            continue;
+        }
+        sources[level] = src;
+        newest = std::max(newest, src->written);
+    }
+    if (t.source == sources[0] && t.loaded >= newest) return true;
+    const uint32_t block = f.compressed ? 4 : 1;
+    end_rendering();
+    barrier();
+    for (uint32_t level = 0; level < levels; ++level) {
+        const Target* src = sources[level];
+        if (src == nullptr) continue;
+        const uint32_t width = std::max(1u, r.width >> level), height = std::max(1u, r.height >> level);
+        // In source texels, which are the destination's blocks.
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        region.extent = {std::min((width + block - 1) / block, src->image.width),
+                         std::min((height + block - 1) / block, src->image.height), 1};
+        vkCmdCopyImage(cmd(), src->image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                       &region);
+    }
+    barrier();
+    t.source = sources[0];
+    t.loaded = stamp();
+    t.dirty = false;
+    return true;
+}
+
 void Renderer::load_texture(Texture& t) {
     const Resource r = decode(t.words.data());
     const FormatInfo f = color_format(r.format);
@@ -215,27 +276,9 @@ void Renderer::load_texture(Texture& t) {
             return;
         }
     }
-    // A render target at the same address, written after the CPU last wrote
-    // the memory, holds the contents.
-    const uint32_t address = gx2::is_macro_tiled(r.tile_mode) ? r.base & ~0x700u : r.base;
-    if (const Target* src = find_target(address, 0, false); src && src->written > src->overwritten) {
-        const FormatInfo sf = color_format(src->format);
-        if (sf.bytes == f.bytes && !f.compressed) {
-            if (t.source != src || t.loaded < src->written) {
-                copy_target_region(*src, t.image, 0, r.width, r.height);
-                t.source = src;
-                t.loaded = stamp();
-                t.dirty = false;
-            }
-            return;
-        }
-        static const Target* reported = nullptr;
-        if (reported != src) {
-            std::fprintf(stderr, "ttt2: gpu: texture 0x%08X (fmt 0x%03X) over a render target of format 0x%03X\n",
-                         address, r.format, src->format);
-        }
-        reported = src;
-    }
+    // Render targets at the texture's address, written after the CPU last
+    // wrote the memory, hold the contents.
+    if (load_texture_from_targets(t)) return;
     if (!t.dirty && t.source == nullptr) return;
 
     const gx2::Surface s = surface_of(r);
@@ -312,7 +355,7 @@ void Renderer::load_texture(Texture& t) {
         vkCmdBlitImage(cmd(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, rgba.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                        VK_FILTER_NEAREST);
         char name[128];
-        std::snprintf(name, sizeof(name), "/tex_%08X_%03X_%ux%u_t%u.png", address, r.format, r.width, r.height,
+        std::snprintf(name, sizeof(name), "/tex_%08X_%03X_%ux%u_t%u.png", uint32_t{s.image}, r.format, r.width, r.height,
                       r.tile_mode);
         save_image(rgba, std::string(dump) + name);
         destroy_image(rgba);

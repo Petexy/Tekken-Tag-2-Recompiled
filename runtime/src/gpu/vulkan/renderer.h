@@ -125,6 +125,7 @@ private:
     // ----------------------------------------------- textures (textures.cpp)
     Texture* texture(const uint32_t words[7]);
     void load_texture(Texture& t);
+    bool load_texture_from_targets(Texture& t);
     void copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height);
     VkSampler sampler(const uint32_t words[3], const float border[4], bool compare);
 
