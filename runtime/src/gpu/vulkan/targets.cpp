@@ -39,6 +39,18 @@ uint32_t strip_swizzle(uint32_t address, uint32_t tile_mode) {
 
 } // namespace
 
+// The screen (1280x720) and the buffers the title derives from it by
+// halving, up to three times: their heights, rounded up to 16 rows, are
+// 720, 368, 192 and 96 (widths vary with the viewport). Shadow maps,
+// texture-compression targets and the GamePad screen are other sizes.
+bool Renderer::upscaled_size(uint32_t width, uint32_t height) const {
+    if (scale_ <= 1 || width < 64) return false;
+    for (uint32_t k = 0; k < 4; ++k) {
+        if (height == ((720u >> k) + 15) / 16 * 16) return true;
+    }
+    return false;
+}
+
 Target* Renderer::find_target(uint32_t address, uint32_t format, bool depth) {
     Target* best = nullptr;
     for (auto& t : targets_) {
@@ -73,14 +85,15 @@ Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
     t->pitch = pitch;
     t->height = height;
     t->tile_mode = tile_mode;
-    t->image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, pitch, height, 1, 1,
+    t->scale = upscaled_size(pitch, height) ? scale_ : 1;
+    t->image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, pitch * t->scale, height * t->scale, 1, 1,
                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             VK_IMAGE_VIEW_TYPE_2D);
     t->written = stamp();
     if (std::getenv("TTT2_TRACE_TARGETS")) {
-        std::fprintf(stderr, "ttt2: gpu: new color target 0x%08X fmt 0x%03X %ux%u tile %u (size 0x%08X info 0x%08X)\n",
-                     address, format, pitch, height, tile_mode, size_reg, info_reg);
+        std::fprintf(stderr, "ttt2: gpu: new color target 0x%08X fmt 0x%03X %ux%u tile %u scale %u (size 0x%08X info 0x%08X)\n",
+                     address, format, pitch, height, tile_mode, t->scale, size_reg, info_reg);
     }
     targets_.push_back(std::move(t));
     return targets_.back().get();
@@ -113,11 +126,12 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
     t->height = height;
     t->tile_mode = tile_mode;
     t->depth = true;
+    t->scale = upscaled_size(pitch, height) ? scale_ : 1;
     if (std::getenv("TTT2_TRACE_TARGETS")) {
-        std::fprintf(stderr, "ttt2: gpu: new depth target 0x%08X fmt 0x%03X %ux%u tile %u (size 0x%08X info 0x%08X)\n",
-                     address, format, pitch, height, tile_mode, size_reg, info_reg);
+        std::fprintf(stderr, "ttt2: gpu: new depth target 0x%08X fmt 0x%03X %ux%u tile %u scale %u (size 0x%08X info 0x%08X)\n",
+                     address, format, pitch, height, tile_mode, t->scale, size_reg, info_reg);
     }
-    t->image = create_image(f.format, f.aspect, pitch, height, 1, 1,
+    t->image = create_image(f.format, f.aspect, pitch * t->scale, height * t->scale, 1, 1,
                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             VK_IMAGE_VIEW_TYPE_2D);
@@ -179,16 +193,32 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
 
 // ----------------------------------------------------------------- copies
 
-void Renderer::copy_target_region(const Target& src, const Image& dst, uint32_t dst_layer, uint32_t width,
-                                  uint32_t height) {
+void Renderer::copy_target_region(const Target& src, const Image& dst, uint32_t dst_scale, uint32_t dst_layer,
+                                  uint32_t width, uint32_t height) {
     end_rendering();
     barrier();
-    VkImageCopy region{};
-    region.srcSubresource = {src.image.aspect, 0, 0, 1};
-    region.dstSubresource = {dst.aspect & src.image.aspect, 0, dst_layer, 1};
-    region.srcSubresource.aspectMask = region.dstSubresource.aspectMask;
-    region.extent = {std::min({width, src.image.width, dst.width}), std::min({height, src.image.height, dst.height}), 1};
-    vkCmdCopyImage(cmd(), src.image.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    const VkImageAspectFlags aspect = dst.aspect & src.image.aspect;
+    if (src.scale == dst_scale) {
+        VkImageCopy region{};
+        region.srcSubresource = {aspect, 0, 0, 1};
+        region.dstSubresource = {aspect, 0, dst_layer, 1};
+        region.extent = {std::min({width * dst_scale, src.image.width, dst.width}),
+                         std::min({height * dst_scale, src.image.height, dst.height}), 1};
+        vkCmdCopyImage(cmd(), src.image.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    } else {
+        // Between an upscaled and a title-sized image: filtered for colour.
+        width = std::min({width, src.image.width / src.scale, dst.width / dst_scale});
+        height = std::min({height, src.image.height / src.scale, dst.height / dst_scale});
+        VkImageBlit blit{};
+        blit.srcSubresource = {aspect, 0, 0, 1};
+        blit.srcOffsets[1] = {static_cast<int32_t>(width * src.scale), static_cast<int32_t>(height * src.scale), 1};
+        blit.dstSubresource = {aspect, 0, dst_layer, 1};
+        blit.dstOffsets[1] = {static_cast<int32_t>(width * dst_scale), static_cast<int32_t>(height * dst_scale), 1};
+        const bool linear = !(aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) &&
+                            (ctx_.format_features(dst.format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+        vkCmdBlitImage(cmd(), src.image.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                       linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    }
     barrier();
 }
 
@@ -269,13 +299,14 @@ void Renderer::copy_surface(const gx2::Surface& src, uint32_t src_level, uint32_
     if (src_depth) {
         Target* to = depth_target(db, ds, db_format_of(dst.format) | field(gx2::surface_info(dst, dst_level).tile_mode, 15, 4));
         if (to == nullptr) return;
-        copy_target_region(*from, to->image, 0, from->pitch, from->height);
+        copy_target_region(*from, to->image, to->scale, 0, from->pitch, from->height);
         to->written = stamp();
         return;
     }
     Target* to = color_target(db, ds, di);
     if (to == nullptr) return;
-    copy_target_region(*from, to->image, 0, std::max(1u, src.width >> src_level), std::max(1u, src.height >> src_level));
+    copy_target_region(*from, to->image, to->scale, 0, std::max(1u, src.width >> src_level),
+                       std::max(1u, src.height >> src_level));
     to->written = stamp();
 }
 
@@ -289,7 +320,7 @@ void Renderer::resolve_color(const gx2::ColorBuffer& src, const gx2::Surface& ds
     if (dst_slice != 0) std::fprintf(stderr, "ttt2: gpu: resolve to slice %u not supported\n", dst_slice);
     Target* to = color_target(db, ds, di);
     if (to == nullptr) return;
-    copy_target_region(*from, to->image, 0, src.surface.width, src.surface.height);
+    copy_target_region(*from, to->image, to->scale, 0, src.surface.width, src.surface.height);
     to->written = stamp();
 }
 
@@ -307,7 +338,7 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
     if (dst_slice != 0) std::fprintf(stderr, "ttt2: gpu: depth conversion to slice %u not supported\n", dst_slice);
     Target* to = depth_target(base, size, db_format | field(li.tile_mode, 15, 4));
     if (to == nullptr) return;
-    copy_target_region(*from, to->image, 0, src.surface.width, src.surface.height);
+    copy_target_region(*from, to->image, to->scale, 0, src.surface.width, src.surface.height);
     to->written = stamp();
 }
 

@@ -759,8 +759,8 @@ void Translator::emit_texture(const TexInstruction& t) {
         }
         coord += ")";
         if (unnormalized) {
-            line(format("ivec%d size = ivec%d(textureSize(%s, 0));", std::max(coords, 2), std::max(coords, 2),
-                        sampler.c_str()));
+            line(format("vec%d size = vec%d(textureSize(%s, 0)) / tex_scale(%uu);", std::max(coords, 2), std::max(coords, 2),
+                        sampler.c_str(), slot));
             std::string scaled = std::string(kVec[coords]) + "(";
             for (int i = 0; i < coords; ++i) {
                 if (i) scaled += ", ";
@@ -777,12 +777,26 @@ void Translator::emit_texture(const TexInstruction& t) {
         if (t.offset[i] & 1) whole = false;
     }
     std::string offset;
+    std::string scaled_coord; // upscaled textures: the offset in the title's texels, as coordinates
     if (has_offset && !cube) {
         if (whole) {
             static constexpr const char* kIvec[] = {"", "", "ivec2", "ivec3"};
-            if (spatial == 1) offset = format(", %d", t.offset[0] / 2);
-            else if (spatial == 2) offset = format(", %s(%d, %d)", kIvec[2], t.offset[0] / 2, t.offset[1] / 2);
-            else offset = format(", %s(%d, %d, %d)", kIvec[3], t.offset[0] / 2, t.offset[1] / 2, t.offset[2] / 2);
+            static constexpr const char* kVec[] = {"", "float", "vec2", "vec3"};
+            std::string o;
+            if (spatial == 1) o = format("%d", t.offset[0] / 2);
+            else if (spatial == 2) o = format("%s(%d, %d)", kIvec[2], t.offset[0] / 2, t.offset[1] / 2);
+            else o = format("%s(%d, %d, %d)", kIvec[3], t.offset[0] / 2, t.offset[1] / 2, t.offset[2] / 2);
+            offset = ", " + o;
+            if (coords == spatial) {
+                scaled_coord = format("(%s + %s(%s) * tex_scale(%uu) / %s(textureSize(%s, 0)))", coord.c_str(),
+                                      kVec[spatial], o.c_str(), slot, kVec[spatial], sampler.c_str());
+            } else {
+                // Arrays: the layer is the last coordinate and takes no offset.
+                const char* sw = spatial == 1 ? "x" : "xy";
+                scaled_coord = format("vec%d(%s.%s + %s(%s) * tex_scale(%uu) / %s(textureSize(%s, 0).%s), %s.%c)", coords,
+                                      coord.c_str(), sw, kVec[spatial], o.c_str(), slot, kVec[spatial], sampler.c_str(),
+                                      sw, coord.c_str(), kChan[spatial]);
+            }
         } else {
             fail("texture offset in half texels");
         }
@@ -792,66 +806,95 @@ void Translator::emit_texture(const TexInstruction& t) {
         fail(format("texture %u sampled both with and without a depth compare", slot));
     }
     const std::string bias = t.lod_bias != 0 ? format(", %.4f", t.lod_bias / 8.0) : std::string();
-    std::string call;
     const bool vertex_lod = vs_; // no derivatives outside pixel shaders
+    // The sampling call for coordinates and an offset (", ivec2(...)" or empty).
+    const auto sample_call = [&](const std::string& coord, const std::string& offset) -> std::string {
+        std::string call;
+        switch (t.inst) {
+        case kSample:
+            if (vertex_lod) call = format("textureLod%s(%s, %s, 0.0%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str());
+            else call = format("texture%s(%s, %s%s%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str(), bias.c_str());
+            break;
+        case kSampleL:
+            call = format("textureLod%s(%s, %s, %s%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), c[3].c_str(), offset.c_str());
+            break;
+        case kSampleLz:
+            call = format("textureLod%s(%s, %s, 0.0%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str());
+            break;
+        case kSampleLb:
+            if (vertex_lod) call = format("textureLod%s(%s, %s, %s%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), c[3].c_str(), offset.c_str());
+            else call = format("texture%s(%s, %s%s, %s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str(), c[3].c_str());
+            break;
+        case kSampleG:
+            call = format("textureGrad%s(%s, %s, gradH.%s, gradV.%s%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(),
+                          spatial == 1 ? "x" : spatial == 2 ? "xy" : "xyz", spatial == 1 ? "x" : spatial == 2 ? "xy" : "xyz", offset.c_str());
+            break;
+        case kSampleC:
+        case kSampleCLz:
+        case kSampleCL: {
+            // The reference value follows the coordinates (w; z for C_L).
+            const std::string ref = t.inst == kSampleCL ? c[2] : c[3];
+            std::string sc;
+            if (cube) sc = "vec4(" + coord + ", " + ref + ")";
+            else if (coords == 1) sc = "vec3(" + coord + ", 0.0, " + ref + ")";
+            else if (coords == 2) sc = "vec3(" + coord + ", " + ref + ")";
+            else sc = "vec4(" + coord + ", " + ref + ")";
+            if (t.inst == kSampleC && !vertex_lod) {
+                call = format("vec4(texture%s(%s, %s%s))", offset.empty() ? "" : "Offset", sampler.c_str(), sc.c_str(), offset.c_str());
+            } else if (cube || coords == 3) {
+                // Array and cube shadow samplers have no explicit-LOD variant: use gradients of 0.
+                const char* g = cube ? "vec3(0.0)" : "vec2(0.0)";
+                call = format("vec4(textureGrad%s(%s, %s, %s, %s%s))", offset.empty() ? "" : "Offset", sampler.c_str(), sc.c_str(), g, g, offset.c_str());
+            } else {
+                const std::string lod = t.inst == kSampleCL ? c[3] : std::string("0.0");
+                call = format("vec4(textureLod%s(%s, %s, %s%s))", offset.empty() ? "" : "Offset", sampler.c_str(), sc.c_str(), lod.c_str(), offset.c_str());
+            }
+            break;
+        }
+        case kFetch4:
+            call = format("textureGather%s(%s, %s%s).zxyw", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str());
+            break;
+        default: break;
+        }
+        return call;
+    };
+    std::string call;
     switch (t.inst) {
     case kSample:
-        if (vertex_lod) call = format("textureLod%s(%s, %s, 0.0%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str());
-        else call = format("texture%s(%s, %s%s%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str(), bias.c_str());
-        break;
     case kSampleL:
-        call = format("textureLod%s(%s, %s, %s%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), c[3].c_str(), offset.c_str());
-        break;
     case kSampleLz:
-        call = format("textureLod%s(%s, %s, 0.0%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str());
-        break;
     case kSampleLb:
-        if (vertex_lod) call = format("textureLod%s(%s, %s, %s%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), c[3].c_str(), offset.c_str());
-        else call = format("texture%s(%s, %s%s, %s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str(), c[3].c_str());
-        break;
     case kSampleG:
-        call = format("textureGrad%s(%s, %s, gradH.%s, gradV.%s%s)", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(),
-                      spatial == 1 ? "x" : spatial == 2 ? "xy" : "xyz", spatial == 1 ? "x" : spatial == 2 ? "xy" : "xyz", offset.c_str());
-        break;
     case kSampleC:
     case kSampleCLz:
-    case kSampleCL: {
-        // The reference value follows the coordinates (w; z for C_L).
-        const std::string ref = t.inst == kSampleCL ? c[2] : c[3];
-        std::string sc;
-        if (cube) sc = "vec4(" + coord + ", " + ref + ")";
-        else if (coords == 1) sc = "vec3(" + coord + ", 0.0, " + ref + ")";
-        else if (coords == 2) sc = "vec3(" + coord + ", " + ref + ")";
-        else sc = "vec4(" + coord + ", " + ref + ")";
-        if (t.inst == kSampleC && !vertex_lod) {
-            call = format("vec4(texture%s(%s, %s%s))", offset.empty() ? "" : "Offset", sampler.c_str(), sc.c_str(), offset.c_str());
-        } else if (cube || coords == 3) {
-            // Array and cube shadow samplers have no explicit-LOD variant: use gradients of 0.
-            const char* g = cube ? "vec3(0.0)" : "vec2(0.0)";
-            call = format("vec4(textureGrad%s(%s, %s, %s, %s%s))", offset.empty() ? "" : "Offset", sampler.c_str(), sc.c_str(), g, g, offset.c_str());
-        } else {
-            const std::string lod = t.inst == kSampleCL ? c[3] : std::string("0.0");
-            call = format("vec4(textureLod%s(%s, %s, %s%s))", offset.empty() ? "" : "Offset", sampler.c_str(), sc.c_str(), lod.c_str(), offset.c_str());
-        }
-        break;
-    }
+    case kSampleCL:
     case kFetch4:
-        call = format("textureGather%s(%s, %s%s).zxyw", offset.empty() ? "" : "Offset", sampler.c_str(), coord.c_str(), offset.c_str());
+        call = sample_call(coord, offset);
+        if (!scaled_coord.empty()) {
+            call = format("(tex_scale(%uu) == 1.0 ? %s : %s)", slot, call.c_str(), sample_call(scaled_coord, "").c_str());
+        }
         break;
     case kLd: {
         const std::string ic = format("ivec%d(", std::max(coords, 2));
         std::string args;
-        for (int i = 0; i < coords; ++i) args += (i ? ", " : "") + format("%s.%c", gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[t.src_sel[i] & 3]);
-        if (coords == 1) call = format("texelFetch(%s, %s.%c, %s.%c)", sampler.c_str(), gpr(t.src_gpr, t.src_rel, 0).c_str(),
-                                       kChan[t.src_sel[0] & 3], gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[t.src_sel[3] & 3]);
+        // Texel coordinates scale with the texture; an array layer does not.
+        for (int i = 0; i < coords; ++i) {
+            const bool texel = i < spatial;
+            args += (i ? ", " : "") + format(texel ? "%s.%c * int(tex_scale(%uu))" : "%s.%c", gpr(t.src_gpr, t.src_rel, 0).c_str(),
+                                            kChan[t.src_sel[i] & 3], slot);
+        }
+        if (coords == 1) call = format("texelFetch(%s, %s.%c * int(tex_scale(%uu)), %s.%c)", sampler.c_str(), gpr(t.src_gpr, t.src_rel, 0).c_str(),
+                                       kChan[t.src_sel[0] & 3], slot, gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[t.src_sel[3] & 3]);
         else call = format("texelFetch(%s, %s%s), %s.%c)", sampler.c_str(), ic.c_str(), args.c_str(), gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[t.src_sel[3] & 3]);
         break;
     }
     case kGetTextureInfo: {
         const std::string lod = format("%s.%c", gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[t.src_sel[0] & 3]);
-        if (coords == 1) call = format("ivec4(textureSize(%s, %s), 0, 0, textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), sampler.c_str());
-        else if (coords == 2) call = format("ivec4(textureSize(%s, %s), 0, textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), sampler.c_str());
-        else call = format("ivec4(textureSize(%s, %s), textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), sampler.c_str());
+        const std::string ts = format("int(tex_scale(%uu))", slot);
+        if (coords == 1) call = format("ivec4(textureSize(%s, %s) / %s, 0, 0, textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), ts.c_str(), sampler.c_str());
+        else if (coords == 2) call = format("ivec4(textureSize(%s, %s) / %s, 0, textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), ts.c_str(), sampler.c_str());
+        else if (array) call = format("ivec4(textureSize(%s, %s) / ivec3(%s, %s, 1), textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), ts.c_str(), ts.c_str(), sampler.c_str());
+        else call = format("ivec4(textureSize(%s, %s) / %s, textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), ts.c_str(), sampler.c_str());
         for (int i = 0; i < 4; ++i) {
             const uint8_t sel = t.dst_sel[i];
             if (sel == kSelMask) continue;
@@ -1182,7 +1225,7 @@ std::string Translator::header() const {
     }
     h += format("layout(set = 0, binding = %u, std140) uniform DrawConstants {\n", abi::kDrawConstantsBinding);
     h += "    uvec4 vs_cb[16];\n    uvec4 ps_cb[16];\n    uvec4 vs_buf[16];\n    uvec4 ps_buf[16];\n";
-    h += "    uvec4 vb[16];\n    uvec4 so[4];\n    uvec4 vtx;\n    vec4 params;\n} dc;\n";
+    h += "    uvec4 vb[16];\n    uvec4 so[4];\n    uvec4 vtx;\n    vec4 params;\n    uvec4 scaled;\n} dc;\n";
     if (out_.uses_registers) {
         h += format("layout(set = 0, binding = %u, std140) uniform Registers { uvec4 c[256]; } regs;\n",
                     vs_ ? abi::kVsRegistersBinding : abi::kPsRegistersBinding);
@@ -1230,6 +1273,10 @@ std::string Translator::header() const {
     }
     h += "\n";
     // Helpers.
+    // Textures copied from upscaled render targets have more texels than the
+    // title knows of: texel coordinates, sizes and offsets are scaled.
+    h += format("float tex_scale(uint slot) { return ((dc.scaled.%c >> slot) & 1u) != 0u ? dc.params.w : 1.0; }\n",
+                vs_ ? 'x' : 'y');
     h += "uint bswap(uint x) { return (x << 24) | ((x << 8) & 0xFF0000u) | ((x >> 8) & 0xFF00u) | (x >> 24); }\n";
     h += "uvec4 swap16(uvec4 x) { return ((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu); }\n";
     h += "uvec4 swap32(uvec4 x) { return uvec4(bswap(x.x), bswap(x.y), bswap(x.z), bswap(x.w)); }\n";
@@ -1334,7 +1381,8 @@ bool Translator::run(std::string& error) {
         for (int k = 0; k < env_.ps_input_count; ++k) {
             const ShaderEnvironment::PsInput& in = env_.ps_inputs[k];
             if (k == env_.ps_position_input) {
-                line(format("R[%d] = floatBitsToInt(vec4(gl_FragCoord.xyz, 1.0 / gl_FragCoord.w));", k));
+                // In the title's pixels when the pass renders upscaled.
+                line(format("R[%d] = floatBitsToInt(vec4(gl_FragCoord.xy / dc.params.z, gl_FragCoord.z, 1.0 / gl_FragCoord.w));", k));
                 continue;
             }
             bool exported = false;

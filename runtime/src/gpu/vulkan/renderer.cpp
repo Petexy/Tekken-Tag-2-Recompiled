@@ -52,6 +52,16 @@ Renderer::Renderer() {
     VK_CHECK(vkCreateSemaphore(ctx_.device, &sci, nullptr, &acquired_));
 
     if (const char* f = std::getenv("TTT2_TRACE_FRAME")) trace_frame_ = std::strtoull(f, nullptr, 10);
+    // Render scale: TTT2_SCALE=1-4, else enough to cover the display
+    // (2 on 1080p and 1440p, 3 on 4K).
+    if (const char* sc = std::getenv("TTT2_SCALE")) {
+        scale_ = static_cast<uint32_t>(std::clamp(std::atoi(sc), 1, 4));
+    } else {
+        uint32_t dw = 0, dh = 0;
+        host::display_size(dw, dh);
+        scale_ = std::clamp((dh + 719) / 720, 1u, 4u);
+    }
+    std::fprintf(stderr, "ttt2: GPU: rendering at %ux%u (scale %u)\n", 1280 * scale_, 720 * scale_, scale_);
     compiler_ = shaderc_compiler_initialize();
     load_pipeline_cache();
     surface_ = host::create_vulkan_surface(ctx_.instance);
@@ -82,7 +92,10 @@ void Renderer::submit(bool wait) {
     recording_ = false;
     bound_pipeline_ = nullptr;
     if (wait) {
+        const double begin = now_seconds();
         const VkResult r = vkWaitForFences(ctx_.device, 1, &fence_, VK_TRUE, 10'000'000'000ull);
+        wait_seconds_ += now_seconds() - begin;
+        ++waits_;
         if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
         VK_CHECK(vkResetFences(ctx_.device, 1, &fence_));
         VK_CHECK(vkResetCommandPool(ctx_.device, pool_, 0));
@@ -187,8 +200,8 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
     const int index = scan_target == gx2::kScanDrc ? 1 : 0;
     Target* t = color_target(buffer);
     if (t == nullptr) return;
-    const uint32_t width = std::min<uint32_t>(buffer.surface.width, t->image.width);
-    const uint32_t height = std::min<uint32_t>(buffer.surface.height, t->image.height);
+    const uint32_t width = std::min<uint32_t>(buffer.surface.width * t->scale, t->image.width);
+    const uint32_t height = std::min<uint32_t>(buffer.surface.height * t->scale, t->image.height);
     Image& scan = scan_[index];
     if (scan.image == VK_NULL_HANDLE || scan.width != width || scan.height != height || scan.format != t->image.format) {
         if (scan.image != VK_NULL_HANDLE) {
@@ -363,7 +376,10 @@ void Renderer::present() {
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &rendered_[index];
     VK_CHECK(vkQueueSubmit(ctx_.queue, 1, &si, fence_));
+    const double begin = now_seconds();
     VK_CHECK(vkWaitForFences(ctx_.device, 1, &fence_, VK_TRUE, UINT64_MAX));
+    wait_seconds_ += now_seconds() - begin;
+    ++waits_;
     VK_CHECK(vkResetFences(ctx_.device, 1, &fence_));
     VK_CHECK(vkResetCommandPool(ctx_.device, pool_, 0));
     ring_.reset();
@@ -482,12 +498,14 @@ void Renderer::swap() {
     if (t - window_start_ >= 10.0) {
         save_pipeline_cache();
         std::fprintf(stderr, "ttt2: gpu: %.1f frames/s, %.0f draws per frame (%.0f skipped), %zu targets, %zu textures, "
-                             "%zu shaders, %zu pipelines\n",
+                             "%zu shaders, %zu pipelines; %.1f GPU waits, %.1f ms waiting per frame\n",
                      frames_ / (t - window_start_), double(draws_) / std::max<uint64_t>(frames_, 1),
                      double(skipped_draws_) / std::max<uint64_t>(frames_, 1), targets_.size(), textures_.size(),
-                     shaders_.size(), pipelines_.size());
+                     shaders_.size(), pipelines_.size(), double(waits_) / std::max<uint64_t>(frames_, 1),
+                     wait_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1));
         window_start_ = t;
-        frames_ = draws_ = skipped_draws_ = 0;
+        frames_ = draws_ = skipped_draws_ = waits_ = 0;
+        wait_seconds_ = 0;
     }
 }
 

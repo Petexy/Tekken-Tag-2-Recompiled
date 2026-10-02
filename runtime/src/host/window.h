@@ -25,5 +25,7 @@ bool run_event_loop(const std::function<bool()>& finished);
 std::vector<const char*> vulkan_instance_extensions();
 VkSurfaceKHR create_vulkan_surface(VkInstance instance);
 void drawable_size(uint32_t& width, uint32_t& height);
+// The desktop resolution of the primary display, in pixels.
+void display_size(uint32_t& width, uint32_t& height);
 
 } // namespace cafe::host

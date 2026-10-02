@@ -51,6 +51,11 @@ struct Context {
     Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags);
     void destroy_buffer(Buffer& buffer);
     VkDeviceMemory allocate_image_memory(VkImage image);
+    VkFormatFeatureFlags format_features(VkFormat format) const {
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(physical, format, &p);
+        return p.optimalTilingFeatures;
+    }
 };
 
 // Guest memory regions imported as buffers.

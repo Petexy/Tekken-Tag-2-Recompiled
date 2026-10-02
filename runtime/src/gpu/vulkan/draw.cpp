@@ -488,7 +488,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     const bool rasterizer_discard = (r(reg::PA_CL_CLIP_CNTL) >> 22) & 1;
     const bool stream_out = r(reg::VGT_STRMOUT_EN) & 1;
     if (color_count == 0 && depth == nullptr && !stream_out) {
-        ++skipped_draws_;
+        // Nothing to write (every target masked off): no effect, nothing lost.
         return;
     }
 
@@ -501,6 +501,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     const ShaderModule* ps = shader(Stage::kPixel, r(reg::SQ_PGM_START_PS) << 8, r(reg::SQ_PGM_START_PS + 4) << 3, 0, 0,
                                     ps_env);
     if (vs == nullptr || ps == nullptr) {
+        report_once(vs == nullptr ? "draw skipped: vertex shader failed, at" : "draw skipped: pixel shader failed, at",
+                    vs == nullptr ? r(reg::SQ_PGM_START_VS) << 8 : r(reg::SQ_PGM_START_PS) << 8);
         ++skipped_draws_;
         return;
     }
@@ -509,6 +511,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     struct Bound {
         VkImageView view;
         VkSampler sampler;
+        bool scaled;
     };
     Bound vs_textures[abi::kTextureSlots]{}, ps_textures[abi::kTextureSlots]{};
     const auto bind_textures = [&](const ShaderModule* s, uint32_t resource_base, uint32_t sampler_base,
@@ -521,9 +524,14 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
             for (int i = 0; i < 3; ++i) sampler_words[i] = r(kSamplerBase + ((sampler_base + slot) * sampler::kWords + i) * 4);
             float border[4];
             for (int i = 0; i < 4; ++i) border[i] = std::bit_cast<float>(r(border_base + slot * 16 + i * 4));
-            const Texture* t = (words[6] >> 30) == (resource::kTypeValidTexture >> 30) ? texture(words) : nullptr;
-            if (t == nullptr) return false;
-            out[slot] = {t->view, sampler(sampler_words, border, (s->info.shadow_mask >> slot) & 1)};
+            const bool valid = (words[6] >> 30) == (resource::kTypeValidTexture >> 30);
+            const Texture* t = valid ? texture(words) : nullptr;
+            if (t == nullptr) {
+                if (!valid) report_once("draw skipped: no texture bound to a sampled slot, resource words[6]", words[6]);
+                else report_once("draw skipped: texture could not be created, format", words[1] >> 26);
+                return false;
+            }
+            out[slot] = {t->view, sampler(sampler_words, border, (s->info.shadow_mask >> slot) & 1), t->scale > 1};
         }
         return true;
     };
@@ -538,6 +546,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     const VkFormat depth_format = depth ? depth->image.format : VK_FORMAT_UNDEFINED;
     const Pipeline* pipe = pipeline(regs, vs, ps, formats, color_count, depth_format, topology_class);
     if (pipe == nullptr) {
+        report_once("draw skipped: pipeline could not be created", 0);
         ++skipped_draws_;
         return;
     }
@@ -572,8 +581,26 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     dc.start_instance = r(reg::SQ_VTX_START_INST_LOC);
     dc.step_rate[0] = r(reg::VGT_INSTANCE_STEP_RATE_0);
     dc.step_rate[1] = r(reg::VGT_INSTANCE_STEP_RATE_0 + 4);
+    // The pass's scale: its attachments are all upscaled or none is.
+    uint32_t pass_scale = 0;
+    bool mixed_scales = false;
+    const auto take_scale = [&](const Target* t) {
+        if (t == nullptr) return;
+        if (pass_scale != 0 && pass_scale != t->scale) mixed_scales = true;
+        pass_scale = std::max(pass_scale, t->scale);
+    };
+    for (uint32_t i = 0; i < color_count; ++i) take_scale(colors[i]);
+    take_scale(depth);
+    if (pass_scale == 0) pass_scale = 1;
+    if (mixed_scales) report_once("draw into upscaled and title-sized targets at once, scale", pass_scale);
     dc.alpha_ref = std::bit_cast<float>(r(reg::SX_ALPHA_REF));
-    dc.point_size = static_cast<float>((r(reg::PA_SU_POINT_SIZE) >> 16) & 0xFFFF) / 8.0f;
+    dc.point_size = static_cast<float>((r(reg::PA_SU_POINT_SIZE) >> 16) & 0xFFFF) / 8.0f * pass_scale;
+    dc.pixel_scale = static_cast<float>(pass_scale);
+    dc.texture_scale = static_cast<float>(scale_);
+    for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
+        if (vs_textures[slot].scaled) dc.vs_scaled_textures |= 1u << slot;
+        if (ps_textures[slot].scaled) dc.ps_scaled_textures |= 1u << slot;
+    }
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(ctx_.properties.limits.minUniformBufferOffsetAlignment, 16);
     VkDeviceSize dc_offset = 0;
     std::memcpy(upload(sizeof(dc), ubo_align, dc_offset), &dc, sizeof(dc));
@@ -600,6 +627,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
         if (d.source != Draw::kAuto) {
             const uint32_t bytes = d.count * (wide ? 4 : 2);
             if (!guest_memory_committed(d.index_address, bytes)) {
+                report_once("draw skipped: index buffer outside guest memory, at", d.index_address);
                 ++skipped_draws_;
                 return;
             }
@@ -744,10 +772,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     const float zscale = std::bit_cast<float>(r(reg::PA_CL_VPORT_XSCALE_0 + 16));
     const float zoffset = std::bit_cast<float>(r(reg::PA_CL_VPORT_XSCALE_0 + 20));
     VkViewport viewport{};
-    viewport.x = xoffset - xscale;
-    viewport.width = 2.0f * xscale;
-    viewport.y = yoffset - yscale;
-    viewport.height = 2.0f * yscale;
+    const float vscale = static_cast<float>(pass_scale);
+    viewport.x = (xoffset - xscale) * vscale;
+    viewport.width = 2.0f * xscale * vscale;
+    viewport.y = (yoffset - yscale) * vscale;
+    viewport.height = 2.0f * yscale * vscale;
     if (viewport.width <= 0.0f) {
         viewport.x += viewport.width;
         viewport.width = std::max(-viewport.width, 1.0f);
@@ -767,6 +796,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
     int32_t x0 = std::max<int32_t>(tl & 0x7FFF, vtl & 0x7FFF), y0 = std::max<int32_t>((tl >> 16) & 0x7FFF, (vtl >> 16) & 0x7FFF);
     int32_t x1 = std::min<int32_t>(br & 0x7FFF, vbr & 0x7FFF), y1 = std::min<int32_t>((br >> 16) & 0x7FFF, (vbr >> 16) & 0x7FFF);
+    const int32_t sc = static_cast<int32_t>(pass_scale);
+    x0 *= sc;
+    y0 *= sc;
+    x1 *= sc;
+    y1 *= sc;
     x1 = std::min<int32_t>(x1, static_cast<int32_t>(pass_width_));
     y1 = std::min<int32_t>(y1, static_cast<int32_t>(pass_height_));
     VkRect2D scissor{{x0, y0}, {static_cast<uint32_t>(std::max(x1 - x0, 0)), static_cast<uint32_t>(std::max(y1 - y0, 0))}};

@@ -217,6 +217,16 @@ attachment formats and blend state.
   (verified against per-element addrlib, `TTT2_CHECK_TILING=1`).
 - The TV scan buffer is blitted, letterboxed, to an SDL3 window
   (`runtime/src/host/window.cpp`, on the process's main thread).
+- Upscaling: targets the size of the screen and its halvings (heights 720,
+  368, 192, 96) get images `TTT2_SCALE` times larger (default: enough to
+  cover the display, 2 on 1080p and 1440p, 3 on 4K). Shadow maps, the
+  GPU's texture-compression targets and the GamePad screen keep the
+  title's size. Passes into upscaled targets scale the viewport, scissor
+  and point size; pixel shaders see `gl_FragCoord` in the title's pixels;
+  textures copied from upscaled targets stay upscaled, and shaders scale
+  texel coordinates, size queries and texel offsets for them
+  (`DrawConstants` carries the scale and a per-stage mask). Copies
+  between images of different scale are filtered blits.
 - Validated 2026-10-02 with the Khronos layer (core, synchronization,
   object lifetime, thread safety) through boot, menus and a match: no
   errors or hazards. One warning remains by design,
@@ -267,6 +277,7 @@ per frame every ten seconds. Renderer debugging:
 | `TTT2_DUMP_TEXTURES=<dir>` | every texture loaded from memory, as PNG |
 | `TTT2_TRACE_TARGETS=1`, `TTT2_WATCH=<hex address>` | render target creation; writes and loads touching an address |
 | `TTT2_CHECK_TILING=1` | compare fast detiling with addrlib per element |
+| `TTT2_SCALE=1..4` | render scale of screen-sized targets (default from the display) |
 | `TTT2_VK_VALIDATION=1` | Khronos validation layer, if installed (synchronization checks: `khronos_validation.validate_sync = true` in a file named by `VK_LAYER_SETTINGS_PATH`) |
 | `TTT2_AUDIO_DUMP=<file.wav>` | everything played, as 48 kHz stereo WAV (also without a device) |
 | `TTT2_TRACE_AX=1` | voice set-up, device mixes, output level |

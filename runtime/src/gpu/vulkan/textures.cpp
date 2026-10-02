@@ -139,28 +139,7 @@ Texture* Renderer::texture(const uint32_t words[7]) {
         }
         auto t = std::make_unique<Texture>();
         std::copy(words, words + 7, t->words.begin());
-        const uint32_t layers = r.dim == gx2::kDim3D ? r.depth : r.depth;
-        t->image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, r.width, r.height, layers, r.last_level + 1,
-                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                view_type_of(r.dim));
-        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vci.image = t->image.image;
-        vci.viewType = view_type_of(r.dim);
-        vci.format = f.format;
-        vci.components = {component(f, r.sel[0]), component(f, r.sel[1]), component(f, r.sel[2]), component(f, r.sel[3])};
-        const uint32_t base_level = std::min(r.base_level, r.last_level);
-        const uint32_t array_layers = r.dim == gx2::kDim3D ? 1 : layers;
-        uint32_t first = std::min(r.first_slice, array_layers - 1);
-        uint32_t count = std::min(r.last_slice, array_layers - 1) - first + 1;
-        if (vci.viewType == VK_IMAGE_VIEW_TYPE_CUBE) {
-            first = 0;
-            count = 6;
-        } else if (vci.viewType == VK_IMAGE_VIEW_TYPE_2D || vci.viewType == VK_IMAGE_VIEW_TYPE_1D ||
-                   vci.viewType == VK_IMAGE_VIEW_TYPE_3D) {
-            count = 1;
-        }
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, base_level, r.last_level - base_level + 1, first, count};
-        VK_CHECK(vkCreateImageView(ctx_.device, &vci, nullptr, &t->view));
+        create_texture_image(*t, 1);
         const gx2::Surface s = surface_of(r);
         t->memory[0][0] = s.image;
         t->memory[0][1] = s.image + s.image_size;
@@ -172,10 +151,46 @@ Texture* Renderer::texture(const uint32_t words[7]) {
     return entry.get();
 }
 
+// (Re)creates a texture's image and view, `scale` times the resource's size.
+void Renderer::create_texture_image(Texture& t, uint32_t scale) {
+    if (t.image.image != VK_NULL_HANDLE) {
+        submit(true); // recorded work may still use the old image
+        vkDestroyImageView(ctx_.device, t.view, nullptr);
+        destroy_image(t.image);
+    }
+    const Resource r = decode(t.words.data());
+    const FormatInfo f = color_format(r.format);
+    t.scale = scale;
+    const uint32_t layers = r.depth;
+    t.image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, r.width * scale, r.height * scale, layers,
+                           r.last_level + 1,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                           view_type_of(r.dim));
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = t.image.image;
+    vci.viewType = view_type_of(r.dim);
+    vci.format = f.format;
+    vci.components = {component(f, r.sel[0]), component(f, r.sel[1]), component(f, r.sel[2]), component(f, r.sel[3])};
+    const uint32_t base_level = std::min(r.base_level, r.last_level);
+    const uint32_t array_layers = r.dim == gx2::kDim3D ? 1 : layers;
+    uint32_t first = std::min(r.first_slice, array_layers - 1);
+    uint32_t count = std::min(r.last_slice, array_layers - 1) - first + 1;
+    if (vci.viewType == VK_IMAGE_VIEW_TYPE_CUBE) {
+        first = 0;
+        count = 6;
+    } else if (vci.viewType == VK_IMAGE_VIEW_TYPE_2D || vci.viewType == VK_IMAGE_VIEW_TYPE_1D ||
+               vci.viewType == VK_IMAGE_VIEW_TYPE_3D) {
+        count = 1;
+    }
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, base_level, r.last_level - base_level + 1, first, count};
+    VK_CHECK(vkCreateImageView(ctx_.device, &vci, nullptr, &t.view));
+}
+
 void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height) {
     const uint32_t bytes = src.image.format == VK_FORMAT_D16_UNORM ? 2 : 4;
-    width = std::min({width, src.image.width, t.image.width});
-    height = std::min({height, src.image.height, t.image.height});
+    if (t.scale != src.scale) create_texture_image(t, src.scale);
+    width = std::min({width * src.scale, src.image.width, t.image.width});
+    height = std::min({height * src.scale, src.image.height, t.image.height});
     VkDeviceSize offset = 0;
     upload(VkDeviceSize{width} * height * bytes, 16, offset);
     end_rendering();
@@ -189,6 +204,15 @@ void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t wid
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     vkCmdCopyBufferToImage(cmd(), ring_.buffer(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     barrier();
+}
+
+static void report_target_texture_once(uint32_t format, uint32_t scale) {
+    static bool reported = false;
+    if (!reported) {
+        std::fprintf(stderr, "ttt2: gpu: compressed texture (fmt 0x%03X) over an upscaled render target (x%u)\n", format,
+                     scale);
+    }
+    reported = true;
 }
 
 // Render targets holding a texture's levels: written by the GPU after the
@@ -227,14 +251,22 @@ bool Renderer::load_texture_from_targets(Texture& t) {
         sources[level] = src;
         newest = std::max(newest, src->written);
     }
-    if (t.source == sources[0] && t.loaded >= newest) return true;
+    if (t.source == sources[0] && t.loaded >= newest && t.scale == sources[0]->scale) return true;
+    // An upscaled target gives an upscaled texture; levels of another scale
+    // than level 0 are left out.
+    const uint32_t scale = sources[0]->scale;
+    if (scale != 1 && f.compressed) {
+        report_target_texture_once(r.format, scale);
+        return false;
+    }
+    if (t.scale != scale) create_texture_image(t, scale);
     const uint32_t block = f.compressed ? 4 : 1;
     end_rendering();
     barrier();
     for (uint32_t level = 0; level < levels; ++level) {
         const Target* src = sources[level];
-        if (src == nullptr) continue;
-        const uint32_t width = std::max(1u, r.width >> level), height = std::max(1u, r.height >> level);
+        if (src == nullptr || src->scale != scale) continue;
+        const uint32_t width = std::max(1u, r.width >> level) * scale, height = std::max(1u, r.height >> level) * scale;
         // In source texels, which are the destination's blocks.
         VkImageCopy region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -296,7 +328,8 @@ void Renderer::load_texture(Texture& t) {
     }
     if (s.mip_levels > 1) h ^= hash_bytes(guest_pointer(s.mipmaps), s.mipmap_size) * 31;
     t.dirty = false;
-    if (h == t.hash && t.source == nullptr && t.loaded != 0) return;
+    if (h == t.hash && t.source == nullptr && t.loaded != 0 && t.scale == 1) return;
+    if (t.scale != 1) create_texture_image(t, 1);
     t.hash = h;
     t.source = nullptr;
     t.loaded = stamp();

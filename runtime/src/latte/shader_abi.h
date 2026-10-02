@@ -43,7 +43,15 @@ struct DrawConstants {
     uint32_t step_rate[2];    // VGT_INSTANCE_STEP_RATE_0/1
     float alpha_ref;          // SX_ALPHA_REF
     float point_size;         // PA_SU_POINT_SIZE, in pixels
-    float pad[2];
+    // Upscaling: render targets the size of the screen (and its halvings)
+    // are drawn at `texture_scale` times their size. A pass into them has
+    // pixel_scale = texture_scale, others 1; the title's pixel coordinates
+    // are gl_FragCoord / pixel_scale.
+    float pixel_scale;
+    float texture_scale;
+    uint32_t vs_scaled_textures; // texture slots holding upscaled images
+    uint32_t ps_scaled_textures;
+    uint32_t pad[2];
 };
 static_assert(sizeof(DrawConstants) % 16 == 0);
 

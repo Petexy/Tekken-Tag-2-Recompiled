@@ -18,6 +18,7 @@ namespace {
 
 SDL_Window* g_window = nullptr;
 std::atomic<uint32_t> g_width{1280}, g_height{720};
+std::atomic<uint32_t> g_display_width{1280}, g_display_height{720};
 
 // Keyboard layout: arrows for the D-pad; X/Z/S/A for A/B/X/Y (the GamePad's
 // diamond); Q/W for L/R, 1/2 for ZL/ZR; Enter Plus, Backspace Minus, H Home;
@@ -103,7 +104,18 @@ bool open_window(const char* title) {
         std::fprintf(stderr, "ttt2: no window: %s\n", SDL_GetError());
         return false;
     }
-    g_window = SDL_CreateWindow(title, 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    // The window starts at the largest multiple of 640x360 that leaves room
+    // on the desktop (1280x720 on 1080p, 1920x1080 on 1440p and up).
+    int window_w = 1280, window_h = 720;
+    if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay())) {
+        g_display_width = static_cast<uint32_t>(mode->w * mode->pixel_density);
+        g_display_height = static_cast<uint32_t>(mode->h * mode->pixel_density);
+        const int fit = std::max(1, std::min((mode->w - 64) / 640, (mode->h - 128) / 360));
+        window_w = 640 * fit;
+        window_h = 360 * fit;
+    }
+    g_window = SDL_CreateWindow(title, window_w, window_h,
+                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (g_window == nullptr) {
         std::fprintf(stderr, "ttt2: no window: %s\n", SDL_GetError());
         return false;
@@ -152,6 +164,11 @@ VkSurfaceKHR create_vulkan_surface(VkInstance instance) {
         fatal("cannot create a Vulkan surface for the window: %s", SDL_GetError());
     }
     return surface;
+}
+
+void display_size(uint32_t& width, uint32_t& height) {
+    width = g_display_width;
+    height = g_display_height;
 }
 
 void drawable_size(uint32_t& width, uint32_t& height) {

@@ -14,6 +14,14 @@
 // address, format and size; textures are images created from guest memory
 // (detiled) or copied from a render target at the same address when the
 // GPU wrote it last.
+//
+// Upscaling (TTT2_SCALE, default from the display): targets the size of the
+// screen and its halvings get images `scale_` times larger; everything else
+// (shadow maps, the GPU's texture-compression targets, the GamePad screen)
+// keeps the title's size. Passes into upscaled targets scale the viewport
+// and scissor, shaders see the title's pixel coordinates, and textures
+// copied from upscaled targets stay upscaled (shaders scale their texel
+// coordinates and sizes).
 
 #include "gpu/backend.h"
 #include "gpu/vulkan/context.h"
@@ -52,6 +60,7 @@ struct Target {
     uint32_t height = 0;    // aligned rows
     uint32_t tile_mode = 0;
     bool depth = false;
+    uint32_t scale = 1;     // image size over the title's size
     Image image;
     uint64_t written = 0;   // event stamp of the last GPU write
     uint64_t overwritten = 0; // event stamp of the last CPU write to its memory
@@ -66,6 +75,7 @@ struct Texture {
     uint64_t hash = 0;       // of the guest data last loaded
     bool dirty = true;       // the CPU wrote its memory since it was loaded
     const Target* source = nullptr; // render target the contents came from
+    uint32_t scale = 1;     // image size over the resource's size (copied from upscaled targets)
 };
 
 struct ShaderModule {
@@ -120,10 +130,16 @@ private:
     Target* depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t info_reg);
     Target* depth_target(const gx2::DepthBuffer& buffer);
     Target* find_target(uint32_t address, uint32_t format, bool depth);
-    void copy_target_region(const Target& src, const Image& dst, uint32_t dst_layer, uint32_t width, uint32_t height);
+    // Copies the top-left width x height (in the title's pixels) of a target
+    // into `dst` (an image `dst_scale` times the title's size); filtered
+    // when the scales differ.
+    void copy_target_region(const Target& src, const Image& dst, uint32_t dst_scale, uint32_t dst_layer,
+                            uint32_t width, uint32_t height);
+    bool upscaled_size(uint32_t width, uint32_t height) const;
 
     // ----------------------------------------------- textures (textures.cpp)
     Texture* texture(const uint32_t words[7]);
+    void create_texture_image(Texture& t, uint32_t scale);
     void load_texture(Texture& t);
     bool load_texture_from_targets(Texture& t);
     void copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height);
@@ -147,6 +163,7 @@ private:
     void capture();
     void save_image(const Image& image, const std::string& path);
 
+    uint32_t scale_ = 1; // upscaling factor of screen-sized targets
     Context ctx_;
     GuestMemory guest_;
     UploadRing ring_;
@@ -199,7 +216,8 @@ private:
     uint64_t trace_frame_ = UINT64_MAX;
 
     // Statistics, printed every ten seconds.
-    uint64_t frames_ = 0, draws_ = 0, skipped_draws_ = 0;
+    uint64_t frames_ = 0, draws_ = 0, skipped_draws_ = 0, waits_ = 0;
+    double wait_seconds_ = 0;
     double window_start_ = 0;
 };
 
