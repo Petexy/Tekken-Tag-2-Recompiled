@@ -4,8 +4,8 @@
 #include "cafe/ppc_ops.h"
 #include "cafe/sysmem.h"
 
+#include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -222,8 +222,13 @@ int run_main_thread(uint32_t entry, uint32_t argc, uint32_t argv, uint32_t stack
         pthread_detach(system);
     }
 
-    // The loader gives the main thread the stack size from the RPX file info
-    // and runs it on core 1.
+    // The main thread runs on core 1 with the stack size from the RPX file
+    // info, but at least kMainStackMin: TTT2's says 64 KB, yet its main
+    // thread nests two functions with 501 KB frames each (sub_02668F50 calls
+    // sub_0266D4E0, reached from the menus), so the console's default thread
+    // stacks must be larger (emulators that run the title give 1 MB).
+    constexpr uint32_t kMainStackMin = 2u << 20;
+    stack_size = std::max(stack_size, kMainStackMin);
     const uint32_t thread = system_alloc(kSize, 8);
     const uint32_t stack = system_alloc(stack_size, 16);
     auto* t = new Thread;

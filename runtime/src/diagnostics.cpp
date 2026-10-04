@@ -2,7 +2,9 @@
 #include "cafe/ppc_ops.h"
 #include "cafe/runtime.h"
 
+#include <dlfcn.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -31,14 +33,29 @@ void print_backtrace(const PPCContext& ctx) {
     }
 }
 
-void fault_handler(int signal, siginfo_t* info, void*) {
+void fault_handler(int signal, siginfo_t* info, void* context) {
     const auto host = reinterpret_cast<uintptr_t>(info->si_addr);
     const auto base = reinterpret_cast<uintptr_t>(guest_base());
     if (base != 0 && host >= base && host - base < (uint64_t{1} << 32) + 0x10000) {
+        const uint64_t guest = host - base;
         std::fprintf(stderr, "\nguest memory fault: access to unmapped guest address 0x%08llX\n",
-                     static_cast<unsigned long long>(host - base));
+                     static_cast<unsigned long long>(guest));
+        // Just below the stack pointer: a frame larger than the stack left.
+        if (t_current != nullptr && guest < t_current->r[1] && t_current->r[1] - guest <= (4u << 20)) {
+            std::fprintf(stderr, "(0x%llX bytes below the stack pointer: a stack overflow)\n",
+                         static_cast<unsigned long long>(t_current->r[1] - guest));
+        }
     } else {
         std::fprintf(stderr, "\nhost fault (signal %d) at %p\n", signal, info->si_addr);
+    }
+    // Where in the recompiled code: `addr2line -f -e <executable> <offset>`
+    // names the guest function (sub_XXXXXXXX).
+    const auto* uc = static_cast<const ucontext_t*>(context);
+    const auto pc = static_cast<uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]);
+    Dl_info where{};
+    if (dladdr(reinterpret_cast<void*>(pc), &where) && where.dli_fname != nullptr) {
+        std::fprintf(stderr, "host code: %s+0x%llx\n", where.dli_fname,
+                     static_cast<unsigned long long>(pc - reinterpret_cast<uintptr_t>(where.dli_fbase)));
     }
     if (t_current != nullptr) {
         print_guest_state(*t_current);

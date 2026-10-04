@@ -342,6 +342,13 @@ presses such as `,72:y,73:x,...` to fight:
 `TTT2_INPUT_SCRIPT="8:plus,21:plus,24:plus,31:a,37:a,41:right,42:right,43:right,45:a,49:right,50:right,53:a,57:a"`.
 Character select refuses a character already picked for the team.
 
+A guest memory fault prints the guest registers and backtrace, says when
+the address lies just below the stack pointer (a stack overflow), and
+gives the host code offset, which `addr2line -f -e build-port/ttt2
+<offset>` turns into the guest function. The main thread gets at least a
+2 MB stack whatever the RPX asks for (TTT2's says 64 KB, but its menus
+nest two functions with 501 KB frames).
+
 Debugging: every guest function is a native function (`sub_XXXXXXXX_orig`),
 so gdb breakpoints, watchpoints and backtraces work on guest code directly;
 host threads are named `<OSThread address>/<core>`. The export thunks take
