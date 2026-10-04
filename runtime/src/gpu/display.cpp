@@ -89,6 +89,12 @@ void host_vsync(uint32_t count) {
     for (uint32_t i = covered; i < count; ++i) vsync_locked();
 }
 
+void host_vsync_stopped() {
+    // As if the last came a period earlier: the timer's next check gives a
+    // blank, at least a period after the host's last.
+    g_last_host_vsync.fetch_sub(kRefreshPeriod.count());
+}
+
 void forget_timer_vsyncs() {
     os::KernelLock lock(os::kernel_mutex());
     g_timer_vsyncs = 0;

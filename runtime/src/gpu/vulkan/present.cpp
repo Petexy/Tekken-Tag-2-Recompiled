@@ -416,8 +416,12 @@ void Renderer::presenter_main() {
     for (;;) {
         const float reported = host::window_refresh_rate();
         choose_presentation(measured_hz_ > 0 ? measured_hz_ : reported);
-        if (every_refresh_) present_every_refresh(reported);
-        else present_timed(reported);
+        if (every_refresh_) {
+            present_every_refresh(reported);
+        } else {
+            gpu::host_vsync_stopped(); // the title's timer takes over at once
+            present_timed(reported);
+        }
         if (host::window_refresh_rate() != reported) measured_hz_ = 0;
     }
 }
@@ -519,7 +523,8 @@ void Renderer::present_every_refresh(float reported_hz) {
     int64_t& last_tick = last_tick_;
     int64_t anchor_refresh = 0;
     double anchor_time = 0; // the last present waited for: its refresh and when it was seen (0: none)
-    uint32_t since_anchor = 0;
+    double last_waited = 0;  // when the last present waited for was seen
+    uint32_t since_waited = 0;
     bool behind = false;     // the last present waited for came a refresh late: so far unconfirmed
     bool unanchored = true;  // no count by time since the last title vblank
     std::vector<double> periods; // one refresh, between presents waited for one after the other
@@ -603,9 +608,9 @@ void Renderer::present_every_refresh(float reported_hz) {
             if (r == VK_TIMEOUT) {
                 // Not reaching the screen (a hidden window): the title's own
                 // timer takes over its vblanks; show the newest image.
+                // (The count by time goes on from the last present seen:
+                // the blanks the timer gives meanwhile count against it.)
                 ++stalls;
-                anchor_time = 0;
-                unanchored = true;
                 std::lock_guard lock(present_mutex_);
                 drain();
                 continue;
@@ -620,7 +625,7 @@ void Renderer::present_every_refresh(float reported_hz) {
             } else {
                 const double t = now_seconds();
                 int64_t shown = refresh + 1; // FIFO: one refresh per present
-                ++since_anchor;
+                ++since_waited;
                 bool reanchor = waited;
                 if (anchor_time != 0) {
                     const double elapsed = (t - anchor_time) / period;
@@ -642,7 +647,9 @@ void Renderer::present_every_refresh(float reported_hz) {
                             behind = false;
                             // One refresh apart, waited for one after the other
                             // with presents queued behind: the display's period.
-                            if (since_anchor == 1 && elapsed < 1.5) periods.push_back(t - anchor_time);
+                            if (since_waited == 1 && last_waited != 0 && t - last_waited < 1.5 * period) {
+                                periods.push_back(t - last_waited);
+                            }
                         }
                     } else {
                         // Already on screen: the thread fell behind and the
@@ -657,10 +664,18 @@ void Renderer::present_every_refresh(float reported_hz) {
                         }
                     }
                 }
+                if (anchor_time == 0) behind = false; // nothing to confirm it against
                 if (reanchor) {
+                    // A part of a refresh left over (a display slower than
+                    // reported by other than a whole factor) carries over;
+                    // small ones (drift, jitter) do not.
+                    const double carried = anchor_time + static_cast<double>(shown - anchor_refresh) * period;
+                    anchor_time = anchor_time != 0 && t - carried > 0.15 * period ? carried : t;
                     anchor_refresh = shown;
-                    anchor_time = t;
-                    since_anchor = 0;
+                }
+                if (waited) {
+                    last_waited = t;
+                    since_waited = 0;
                 }
                 refreshes += static_cast<uint32_t>(shown - refresh);
                 refresh = shown;
@@ -669,7 +684,9 @@ void Renderer::present_every_refresh(float reported_hz) {
         // The title's vblanks, at every per_frame-th refresh (each one
         // passed, up to a few after a stall).
         if (const int64_t tick = refresh / per_frame * per_frame; tick > last_tick) {
-            const int64_t passed = last_tick < 0 ? 1 : std::min<int64_t>((tick - last_tick) / per_frame, 4);
+            // (Rounded up: an old tick from another rate need not be a multiple.)
+            const int64_t passed =
+                last_tick < 0 ? 1 : std::clamp<int64_t>((tick - last_tick + per_frame - 1) / per_frame, 1, 4);
             last_tick = tick;
             if (anchor_time != 0) tick_time_.store(now_seconds());
             tick_refresh_.store(tick);

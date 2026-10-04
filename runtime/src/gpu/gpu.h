@@ -60,6 +60,9 @@ void host_vsync(uint32_t count = 1);
 // The host's blanks restart without reporting the time they were missing
 // (counted anew): the timer's blanks meanwhile stand.
 void forget_timer_vsyncs();
+// The host's blanks stop (presentation no longer follows the display): the
+// timer stands in from its next period.
+void host_vsync_stopped();
 void set_swap_interval(uint32_t interval);
 uint32_t swap_interval();
 

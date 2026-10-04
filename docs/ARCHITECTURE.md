@@ -285,10 +285,13 @@ attachment formats and blend state.
   counts refreshes one per present reaching the screen, plus, by time
   since the last present it waited for, any refresh the screen showed
   twice (once the next present confirms it: a single late wake-up is not
-  one) and, when it fell behind, the time that passed. Every 60th of a second of them is the title's vertical blank
+  one), part refreshes carried over (a display slower than reported by
+  other than a whole factor) and, when it fell behind or the compositor
+  stalled, the time that passed. Every 60th of a second of them is the title's vertical blank
   (`gpu::host_vsync`; the 59.94 Hz timer stands in when they stop for two
-  frames, e.g. for a hidden window, and the blanks it gives count against
-  the host's when they resume), and each frame's images are due at fixed
+  frames, e.g. for a hidden window, or at once when presentation stops
+  following the display, and the blanks it gives count against the
+  host's when they resume), and each frame's images are due at fixed
   refreshes after the vblank its frame started from, the extra frames
   first and the real one last. So the title runs at the display's own
   rate (59.99 Hz on a 239.97 Hz display) and every image stays on screen
