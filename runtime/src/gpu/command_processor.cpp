@@ -441,7 +441,7 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
         if (g_log.enabled) {
             // The replays read the frame's guest memory again: the title
             // learns the frame is done (and may reuse its buffers) after them.
-            if (g_log.complete) {
+            if (g_log.complete && g_backend->want_replays()) {
                 for (uint32_t n = 1; n < g_backend->frames_per_frame(); ++n) replay_frame(n);
             }
             g_backend->frame_shown();

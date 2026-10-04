@@ -59,7 +59,8 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
   display's refreshes and every image stays on screen equally long: on an
   RX 9060 XT with a 240 Hz display, fights run at 60 game frames and 120
   shown frames per second at 2x, 99% of images shown for exactly two
-  refreshes.
+  refreshes. When other programs keep the GPU busy, frames go out
+  without their extra frame rather than slowing the game down.
 - The renderer (`runtime/src/gpu/vulkan/`) translates the game's Latte
   shaders to GLSL/SPIR-V (`runtime/src/latte/`), reads vertex and uniform
   data from guest memory in place, detiles textures with AMD's address

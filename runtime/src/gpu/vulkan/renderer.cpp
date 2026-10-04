@@ -503,13 +503,14 @@ void Renderer::swap() {
     if (t - window_start_ >= 10.0) {
         save_pipeline_cache();
         std::fprintf(stderr, "ttt2: gpu: %.1f frames/s, %.0f draws per frame (%.0f skipped), %zu targets, %zu textures, "
-                             "%zu shaders, %zu pipelines; %.1f GPU waits, %.1f ms waiting (%.1f ms GPU busy) per frame; %llu/%llu extra frames blended, %.1f MB recorded; replay %.1f ms (matching %.1f)\n",
+                             "%zu shaders, %zu pipelines; %.1f GPU waits, %.1f ms waiting (%.1f ms GPU busy) per frame; %llu/%llu extra frames blended (%llu skipped: GPU behind), %.1f MB recorded; replay %.1f ms (matching %.1f)\n",
                      frames_ / (t - window_start_), double(draws_) / std::max<uint64_t>(frames_, 1),
                      double(skipped_draws_) / std::max<uint64_t>(frames_, 1), targets_.size(), textures_.size(),
                      shaders_.size(), pipelines_.size(), double(waits_) / std::max<uint64_t>(frames_, 1),
                      wait_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1), busy_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1),
                      static_cast<unsigned long long>(blended_replays_),
-                     static_cast<unsigned long long>(replays_), frame_records_[current_record_ ^ 1].used / 1e6,
+                     static_cast<unsigned long long>(replays_), static_cast<unsigned long long>(skipped_replays_),
+                     frame_records_[current_record_ ^ 1].used / 1e6,
                      replay_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1), match_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1));
         if (!swap_delays_.empty()) {
             std::sort(swap_delays_.begin(), swap_delays_.end());
@@ -522,7 +523,7 @@ void Renderer::swap() {
             swap_delays_.clear();
         }
         replay_seconds_ = match_seconds_ = 0;
-        replays_ = blended_replays_ = 0;
+        replays_ = blended_replays_ = skipped_replays_ = 0;
         window_start_ = t;
         frames_ = draws_ = skipped_draws_ = waits_ = 0;
         wait_seconds_ = busy_seconds_ = 0;

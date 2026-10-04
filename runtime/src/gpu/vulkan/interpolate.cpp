@@ -362,6 +362,7 @@ void Renderer::begin_replay(uint32_t n) {
     replay_started_ = started;
     end_rendering();
     replaying_ = true;
+    replayed_ = true;
     replay_draw_ = 0;
     blended_.clear();
     replay_t_ = static_cast<float>(n) / static_cast<float>(frames_per_frame_);
@@ -465,6 +466,17 @@ void Renderer::begin_replay(uint32_t n) {
     }
 }
 
+// With the GPU still on the previous frame (other programs share it, or the
+// frames cost more than a frame's time), the frame goes out without extra
+// frames, the previous image staying up through their part of its slot.
+bool Renderer::want_replays() {
+    uint64_t done = 0;
+    VK_CHECK(vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done));
+    if (done >= previous_frame_ready_) return true;
+    ++skipped_replays_;
+    return false;
+}
+
 void Renderer::end_replay() {
     end_rendering();
     replaying_ = false;
@@ -479,7 +491,8 @@ void Renderer::frame_shown() {
         size_t swapped = 0;
         for (Target* t : carried_) {
             const bool rewritten = t->written_frame + 1 == frame_number_;
-            if (rewritten && t->start_copied) {
+            // (Without replays the target still holds the frame's result.)
+            if (rewritten && t->start_copied && replayed_) {
                 copy_image(t->end_copy, t->image);
                 t->written = stamp();
                 ++swapped;
@@ -494,6 +507,7 @@ void Renderer::frame_shown() {
         }
         carried_.clear();
     }
+    replayed_ = false;
     // This frame's draws and replays read its record until they finish.
     record_value_[current_record_] = recording_ ? submitted_ + 1 : submitted_;
     current_record_ ^= 1;

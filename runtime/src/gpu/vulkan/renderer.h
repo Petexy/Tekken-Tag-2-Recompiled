@@ -128,6 +128,7 @@ public:
     uint64_t flush() override;
     void wait_for(uint64_t value) override;
     uint32_t frames_per_frame() const override { return frames_per_frame_; }
+    bool want_replays() override;
     void begin_replay(uint32_t n) override;
     void end_replay() override;
     void frame_shown() override;
@@ -243,6 +244,7 @@ private:
     void replace_constants(uint32_t draw_index, latte::abi::DrawConstants& dc);
     uint32_t frames_per_frame_ = 1; // frames shown per frame the title renders
     bool replaying_ = false;
+    bool replayed_ = false; // this frame's extra frames were rendered
     float replay_t_ = 1.0f;          // blend position: 0 the previous frame, 1 this one
     bool replay_blend_ = false;
     uint32_t replay_draw_ = 0;
@@ -256,7 +258,7 @@ private:
     void note_target_read(const Target* t);
     void copy_image(const Image& src, const Image& dst);
     std::vector<Target*> carried_; // this frame's carried targets
-    uint64_t replays_ = 0, blended_replays_ = 0;
+    uint64_t replays_ = 0, blended_replays_ = 0, skipped_replays_ = 0;
     double match_seconds_ = 0, replay_seconds_ = 0;
     std::chrono::steady_clock::time_point replay_started_;
 
@@ -288,8 +290,11 @@ private:
         double reference; // when its slot was chosen (the frame's swap)
         // Presenting every refresh: the refresh it is due at, the title
         // vblank its frame started from, whether it is its frame's first
-        // image, and whether it was found complete.
+        // image (and how many refreshes after the frame's first slot it is
+        // due: a frame without extra frames), and whether it was found
+        // complete.
         int64_t due = 0, tick = 0;
+        int32_t offset = 0;
         bool first = false, seen_ready = false, counted_late = false;
     };
     void queue_present(const QueuedFrame& f);
@@ -298,10 +303,12 @@ private:
     std::vector<uint8_t> present_free_;
     uint32_t pending_real_ = UINT32_MAX; // interpolation: this frame's image, shown after its extra frames
     uint64_t pending_ready_ = 0;
+    uint64_t last_image_ready_ = 0;     // timeline value of the newest presentation image
+    uint64_t previous_frame_ready_ = 0; // ... of the previous title frame's last image
     uint32_t extra_frames_ = 0;
     double frame_base_time_ = 0;
     int64_t frame_base_due_ = 0, frame_base_tick_ = 0; // presenting every refresh
-    void queue_frame_image(uint32_t image, uint64_t ready, uint32_t n);
+    void queue_frame_image(uint32_t image, uint64_t ready, uint32_t n, bool first);
     double frame_slot();
     double last_slot_ = 0;                    // display time of the last frame's slot (GPU thread)
     double slot_reference_ = 0;               // when the last slot was chosen

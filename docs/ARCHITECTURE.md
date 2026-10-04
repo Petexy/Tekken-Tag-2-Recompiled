@@ -271,6 +271,13 @@ attachment formats and blend state.
   (`TTT2_INTERP_TEST=1`) every extra frame equals its real frame pixel for
   pixel (checked through menus, character select and fights). Particles
   whose geometry the CPU rebuilds each frame and the HUD move at 60 Hz.
+  A frame whose swap comes while the GPU has yet to finish the previous
+  frame's images gets no extra frames (the previous image stays up
+  through their part of its slot): the title learns a frame is done only
+  after its replays, so on a shared or overloaded GPU they would slow the
+  game itself (measured: a fight on a desktop compositor taking ~80% of
+  the GPU went from 46-51 to 55-60 title frames a second; the statistics
+  line counts the extra frames skipped).
 - Presentation (`gpu/vulkan/present.cpp`) runs on its own thread and on a
   compute queue (AMD's asynchronous compute, `TTT2_PRESENT_BLIT=1` for
   the rendering queue): a present there waits only for its own frame, not
@@ -322,7 +329,10 @@ attachment formats and blend state.
 
 `build-port/ttt2 "<path>/TEKKEN TAG 2 Wii U EDITION (EU).wua"` reads the
 executable and all assets from the archive in place (a directory with
-code/, content/, meta/ also works). Saves go to `$TTT2_SAVE_DIR`, default
+code/, content/, meta/ also works). Reading through the archive costs
+nothing measurable in play (`TTT2_TRACE_FS=1`): a fight reads ~0.5 MB of
+music per 10 s (0.3 ms), loading a stage ~95 MB (0.5 s from a hard disk,
+mostly seeks). Saves go to `$TTT2_SAVE_DIR`, default
 `~/.local/share/ttt2/save`. The OS layer is in `runtime/src/os/`; each OS
 function is plain C++ registered with `CAFE_EXPORT(module, name, fn)`, and
 anything not implemented stops with the function's name and a guest

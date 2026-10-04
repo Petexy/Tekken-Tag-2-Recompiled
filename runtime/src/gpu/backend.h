@@ -72,6 +72,10 @@ public:
     // extra frame, between begin_replay(n) and end_replay(), n = 1 ..
     // frames_per_frame() - 1, after swap(). Then frame_shown() follows.
     virtual uint32_t frames_per_frame() const { return 1; }
+    // Whether to render the extra frames of the frame just swapped: not
+    // while the GPU has yet to finish the previous frame, as they would
+    // make the title wait for its flips (its speed comes first).
+    virtual bool want_replays() { return true; }
     virtual void begin_replay(uint32_t) {}
     virtual void end_replay() {}
     virtual void frame_shown() {}

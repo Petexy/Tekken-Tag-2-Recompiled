@@ -220,6 +220,7 @@ uint32_t Renderer::copy_scan_to_present_image(uint64_t& ready) {
     vkCmdCopyImage(cmd(), scan_[0].image, VK_IMAGE_LAYOUT_GENERAL, present_images_[i].image, VK_IMAGE_LAYOUT_GENERAL, 1,
                    &region);
     ready = submit(false);
+    last_image_ready_ = ready;
     return i;
 }
 
@@ -249,13 +250,14 @@ int64_t Renderer::frame_due() {
     return frame_base_tick_ + refresh_lead_.load();
 }
 
-void Renderer::queue_frame_image(uint32_t image, uint64_t ready, uint32_t n) {
+void Renderer::queue_frame_image(uint32_t image, uint64_t ready, uint32_t n, bool first) {
     QueuedFrame f{};
     f.image = image;
     f.ready = ready;
-    f.due = frame_base_due_ + int64_t{n} * (refreshes_per_frame_.load() / frames_per_frame_);
+    f.offset = static_cast<int32_t>(n * (refreshes_per_frame_.load() / frames_per_frame_));
+    f.due = frame_base_due_ + f.offset;
     f.tick = frame_base_tick_;
-    f.first = n == 0;
+    f.first = first;
     queue_present(f);
 }
 
@@ -281,6 +283,7 @@ double Renderer::frame_slot() {
 // The title finished a frame (swap): shown in its slot, or, with
 // interpolation, after the extra frames the replays render.
 void Renderer::show_frame() {
+    previous_frame_ready_ = last_image_ready_;
     if (!scan_valid_[0]) return;
     sequence_saving_ = sequence_left_ > 0;
     if (sequence_saving_) {
@@ -293,7 +296,7 @@ void Renderer::show_frame() {
     if (frames_per_frame_ == 1) {
         if (every_refresh_) {
             frame_base_due_ = frame_due();
-            queue_frame_image(image, ready, 0);
+            queue_frame_image(image, ready, 0, true);
         } else {
             queue_present(image, frame_slot(), ready);
         }
@@ -302,9 +305,10 @@ void Renderer::show_frame() {
     if (pending_real_ != UINT32_MAX) { // a frame without replays
         if (every_refresh_) {
             frame_base_due_ = frame_due();
-            queue_frame_image(pending_real_, pending_ready_, frames_per_frame_ - 1);
+            queue_frame_image(pending_real_, pending_ready_, frames_per_frame_ - 1, true);
         } else {
-            queue_present(pending_real_, frame_slot(), pending_ready_);
+            queue_present(pending_real_, frame_slot() + (frames_per_frame_ - 1) * kFramePeriod / frames_per_frame_,
+                          pending_ready_);
         }
     }
     pending_real_ = image;
@@ -329,7 +333,7 @@ void Renderer::show_extra_frame() {
     const uint32_t image = copy_scan_to_present_image(ready);
     if (every_refresh_) {
         if (extra_frames_ == 0) frame_base_due_ = frame_due();
-        queue_frame_image(image, ready, extra_frames_);
+        queue_frame_image(image, ready, extra_frames_, extra_frames_ == 0);
     } else {
         if (extra_frames_ == 0) frame_base_time_ = frame_slot();
         queue_present(image, frame_base_time_ + extra_frames_ * kFramePeriod / frames_per_frame_, ready);
@@ -341,9 +345,11 @@ void Renderer::finish_frame_presentation() {
     if (pending_real_ == UINT32_MAX) return;
     if (every_refresh_) {
         if (extra_frames_ == 0) frame_base_due_ = frame_due();
-        queue_frame_image(pending_real_, pending_ready_, frames_per_frame_ - 1);
+        queue_frame_image(pending_real_, pending_ready_, frames_per_frame_ - 1, extra_frames_ == 0);
     } else {
-        const double time = extra_frames_ ? frame_base_time_ + extra_frames_ * kFramePeriod / frames_per_frame_ : frame_slot();
+        // (Without extra frames the real image still comes last in its slot.)
+        const double start = extra_frames_ ? frame_base_time_ : frame_slot();
+        const double time = start + (frames_per_frame_ - 1) * kFramePeriod / frames_per_frame_;
         queue_present(pending_real_, time, pending_ready_);
     }
     pending_real_ = UINT32_MAX;
@@ -709,7 +715,7 @@ void Renderer::present_every_refresh(float reported_hz) {
                 if (!f.seen_ready && done >= f.ready) {
                     f.seen_ready = true;
                     if (f.first) {
-                        const int32_t need = static_cast<int32_t>(std::max<int64_t>(0, at - f.tick));
+                        const int32_t need = static_cast<int32_t>(std::max<int64_t>(0, at - f.tick - f.offset));
                         // Stalls (loading) over two frames are not measures.
                         if (need <= 3 * per_frame + static_cast<int32_t>(queued)) {
                             needs.push_back(need);
