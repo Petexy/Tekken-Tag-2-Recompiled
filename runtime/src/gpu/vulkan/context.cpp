@@ -3,6 +3,7 @@
 #include "cafe/layout.h"
 #include "cafe/runtime.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,6 +52,19 @@ void Context::init(const std::vector<const char*>& instance_extensions) {
             extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         } else {
             std::fprintf(stderr, "ttt2: TTT2_VK_VALIDATION: the validation layer is not installed\n");
+        }
+    }
+    {
+        uint32_t count = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> available(count);
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, available.data());
+        surface_capabilities2 = has_extension(available, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+        if (surface_capabilities2 &&
+            std::none_of(extensions.begin(), extensions.end(), [](const char* e) {
+                return std::strcmp(e, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+            })) {
+            extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
         }
     }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -134,6 +148,8 @@ void Context::init(const std::vector<const char*>& instance_extensions) {
     std::vector<const char*> device_extensions(std::begin(kRequired), std::end(kRequired));
     custom_border_color = has_extension(available, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (custom_border_color) device_extensions.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    present_wait = surface_capabilities2 && has_extension(available, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
+                   has_extension(available, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME);
 
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -141,8 +157,13 @@ void Context::init(const std::vector<const char*>& instance_extensions) {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f12;
     f12.pNext = &f13;
-    if (custom_border_color) f13.pNext = &border;
+    VkPhysicalDevicePresentId2FeaturesKHR id2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR};
+    VkPhysicalDevicePresentWait2FeaturesKHR wait2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR};
+    id2.pNext = &wait2;
+    border.pNext = present_wait ? &id2 : nullptr;
+    f13.pNext = custom_border_color ? static_cast<void*>(&border) : present_wait ? static_cast<void*>(&id2) : nullptr;
     vkGetPhysicalDeviceFeatures2(physical, &f2);
+    present_wait = present_wait && id2.presentId2 && wait2.presentWait2;
     const auto require = [](VkBool32 feature, const char* name) {
         if (!feature) fatal("Vulkan: the GPU lacks %s", name);
     };
@@ -169,6 +190,17 @@ void Context::init(const std::vector<const char*>& instance_extensions) {
         eborder.customBorderColorWithoutFormat = border.customBorderColorWithoutFormat;
         custom_border_color = border.customBorderColors && border.customBorderColorWithoutFormat;
         e13.pNext = &eborder;
+    }
+    VkPhysicalDevicePresentId2FeaturesKHR eid2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR};
+    VkPhysicalDevicePresentWait2FeaturesKHR ewait2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR};
+    if (present_wait) {
+        device_extensions.push_back(VK_KHR_PRESENT_ID_2_EXTENSION_NAME);
+        device_extensions.push_back(VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME);
+        eid2.presentId2 = VK_TRUE;
+        ewait2.presentWait2 = VK_TRUE;
+        eid2.pNext = &ewait2;
+        ewait2.pNext = const_cast<void*>(e13.pNext);
+        e13.pNext = &eid2;
     }
     VkPhysicalDeviceFeatures2 e2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     e2.pNext = &e12;
@@ -215,6 +247,10 @@ void Context::init(const std::vector<const char*>& instance_extensions) {
         vkGetDeviceProcAddr(device, "vkGetMemoryHostPointerPropertiesEXT"));
     cmd_push_descriptor_set =
         reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR"));
+    if (present_wait) {
+        wait_for_present = reinterpret_cast<PFN_vkWaitForPresent2KHR>(vkGetDeviceProcAddr(device, "vkWaitForPresent2KHR"));
+        present_wait = wait_for_present != nullptr;
+    }
 }
 
 uint32_t Context::memory_type(uint32_t type_bits, VkMemoryPropertyFlags flags) const {

@@ -209,6 +209,7 @@ public: // record types, shared with interpolate.cpp's helpers
         uint64_t key;
         uint32_t first_slot, slot_count;
         uint64_t hash; // of all its constants
+        bool blend;    // a depth-tested (3D) draw: its constants blend in replays
     };
     // A frame's draws and the constant data they read, copied into
     // GPU-visible memory: the frame's own draws read it there too, so a
@@ -268,9 +269,14 @@ private:
     void show_extra_frame();
     void finish_frame_presentation();
     void presenter_main();
+    void present_timed();
+    void present_every_refresh();
     void note_presentation(double scheduled, double presented);
     void create_swapchain(VkFormat image_format);
-    void present_image(uint32_t index, uint64_t ready);
+    // Presents image `index` once its copy (timeline value `ready`) is done;
+    // `present_id` > 0 tags the present for present waits. False if the
+    // swapchain had to be recreated (nothing was presented).
+    bool present_image(uint32_t index, uint64_t ready, uint64_t present_id = 0);
     std::mutex queue_mutex_; // vkQueueSubmit and vkQueuePresentKHR from either thread
     std::mutex present_mutex_;
     std::condition_variable present_cv_;
@@ -279,7 +285,13 @@ private:
         double time;    // steady clock seconds
         uint64_t ready; // timeline value at which the image is complete
         double reference; // when its slot was chosen (the frame's swap)
+        // Presenting every refresh: the refresh it is due at, the title
+        // vblank its frame started from, whether it is its frame's first
+        // image, and whether it was found complete.
+        int64_t due = 0, tick = 0;
+        bool first = false, seen_ready = false;
     };
+    void queue_present(const QueuedFrame& f);
     std::deque<QueuedFrame> present_queue_;
     std::vector<Image> present_images_;
     std::vector<uint8_t> present_free_;
@@ -287,10 +299,25 @@ private:
     uint64_t pending_ready_ = 0;
     uint32_t extra_frames_ = 0;
     double frame_base_time_ = 0;
+    int64_t frame_base_due_ = 0, frame_base_tick_ = 0; // presenting every refresh
+    void queue_frame_image(uint32_t image, uint64_t ready, uint32_t n);
     double frame_slot();
     double last_slot_ = 0;                    // display time of the last frame's slot (GPU thread)
     double slot_reference_ = 0;               // when the last slot was chosen
     std::atomic<double> present_lead_{0.004}; // swap to slot, adapted by the presentation thread
+    // Presenting every refresh (FIFO, present waits) of a display that
+    // refreshes refreshes_per_frame_ times per title frame: the
+    // presentation thread drives the title's vblanks, frames are due at
+    // refresh counts.
+    bool every_refresh_ = false;
+    uint64_t swapchain_generation_ = 0; // counts swapchain creations (presentation thread)
+    uint32_t refreshes_per_frame_ = 1;
+    double refresh_period_ = 1.0 / 60.0;          // seconds
+    std::atomic<int64_t> tick_refresh_{0};        // refresh of the last title vblank
+    std::atomic<double> tick_time_{0};            // and when it was seen
+    std::vector<float> swap_delays_;              // GPU thread: swap after its vblank, ms (statistics)
+    std::atomic<int32_t> refresh_lead_{0};        // title vblank to the frame's first image, in refreshes
+    int64_t frame_due();
     bool compute_present_ = false;        // presenting from a compute queue with a scaling shader
     uint32_t present_family_ = 0;
     VkQueue present_queue_handle_ = VK_NULL_HANDLE;
@@ -309,6 +336,9 @@ private:
     void save_image(const Image& image, const std::string& path);
     int64_t captured_frame_ = -1; // TTT2_CAPTURE: frame number and index of the last capture
     uint32_t captured_index_ = 0;
+    uint32_t sequence_left_ = 0, sequence_frame_ = 0; // TTT2_CAPTURE_SEQUENCE: frames still to save
+    bool sequence_saving_ = false;
+    void save_sequence_image(uint32_t n);
 
     uint32_t scale_ = 1; // upscaling factor of screen-sized targets
     Context ctx_;

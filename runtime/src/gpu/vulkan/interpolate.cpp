@@ -10,14 +10,15 @@
 // and this frame's. The frames go to the display in order, the extra ones
 // first, the real one last (present.cpp).
 //
-// While a frame renders, every draw records a key (its shaders, first
-// vertex buffer, target and size) and a copy of the constant data it reads.
-// A replay matches each draw to the previous frame's draw with the same key
-// (in order), and blends word by word: values that look like ordinary
-// floats in both frames move linearly, anything else (integers, flags,
-// NaNs) takes this frame's value. Each block is read in the byte order in
-// which its values look like floats. When too few draws match (a new
-// scene), the extra frames show this frame as it is.
+// While a frame renders, every draw records a key (its shaders, targets,
+// vertex count and first texture) and a copy of the constant data it
+// reads. A replay matches each draw to the previous frame's draw with the
+// same key and the most similar data (begin_replay), and blends word by
+// word: values that look like ordinary floats in both frames move
+// linearly, anything else (integers, flags, NaNs) takes this frame's
+// value. Each block is read in the byte order in which its values look
+// like floats. Only depth-tested draws, the 3D scene, blend. When too few
+// draws match (a new scene), the extra frames show this frame as it is.
 
 #include "gpu/vulkan/renderer.h"
 
@@ -188,7 +189,14 @@ uint32_t Renderer::begin_draw_record(const Registers& regs, const Draw& d) {
         r(reg::DB_DEPTH_BASE), r(reg::VGT_PRIMITIVE_TYPE), d.count, d.num_instances,
         r(kResourceBase + resource::kPsTexture * resource::kWords * 4 + 8),
     };
-    f.draws.push_back({fnv(key_words, std::size(key_words)), static_cast<uint32_t>(f.slots.size()), 0, 0xCBF29CE484222325ull});
+    // Only the 3D scene blends. Flat (not depth-tested) draws, menus and the
+    // HUD, are shown as the frame has them: they often place text and parts
+    // of a widget with vertex data the CPU writes each frame, which a replay
+    // cannot blend, so blending the rest would pull a widget apart.
+    static const bool flat_too = std::getenv("TTT2_INTERP_2D") != nullptr;
+    const bool depth_tested = (r(reg::DB_DEPTH_CONTROL) & 2) && (r(reg::DB_DEPTH_INFO) & 7) && r(reg::DB_DEPTH_BASE);
+    f.draws.push_back({fnv(key_words, std::size(key_words)), static_cast<uint32_t>(f.slots.size()), 0,
+                       0xCBF29CE484222325ull, depth_tested || flat_too});
     return static_cast<uint32_t>(f.draws.size() - 1);
 }
 
@@ -267,7 +275,7 @@ void Renderer::replace_constants(uint32_t draw_index, abi::DrawConstants& dc) {
     const FrameRecord& prev = frame_records_[current_record_ ^ 1];
     if (draw_index >= cur.draws.size()) return;
     const DrawRecord& d = cur.draws[draw_index];
-    const int32_t m = replay_blend_ && draw_index < match_.size() ? match_[draw_index] : -1;
+    const int32_t m = replay_blend_ && d.blend && draw_index < match_.size() ? match_[draw_index] : -1;
     for (uint32_t i = 0; i < d.slot_count; ++i) {
         const SlotRecord& s = cur.slots[d.first_slot + i];
         const uint8_t* current = cur.data.mapped + s.offset;
@@ -326,7 +334,9 @@ void Renderer::note_target_read(const Target* c) {
     t->start_copied = t->rewrites;
     if (!t->start_copied) return;
     if (t->start_copy.image == VK_NULL_HANDLE) {
-        const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        // (Sampled only because every image gets a view.)
+        const VkImageUsageFlags usage =
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         t->start_copy = create_image(t->image.format, t->image.aspect, t->image.width, t->image.height, 1, 1, usage,
                                      VK_IMAGE_VIEW_TYPE_2D);
         t->end_copy = create_image(t->image.format, t->image.aspect, t->image.width, t->image.height, 1, 1, usage,
@@ -367,24 +377,76 @@ void Renderer::begin_replay(uint32_t n) {
     const FrameRecord& cur = frame_records_[current_record_];
     const FrameRecord& prev = frame_records_[current_record_ ^ 1];
     match_.assign(cur.draws.size(), -1);
-    // Draws pair in order among those with the same key; a pair whose
+    // Draws pair among those with the same key. Many share one (menu and
+    // HUD sprites: the same shaders and texture, a quad each), and they come
+    // and go (a blinking cursor), so pairing them in order would pair
+    // neighbours and draw each halfway to the next. Draws whose constants did
+    // not change pair first, then each other draw with the most similar
+    // unpaired draw near its place among those with its key. A pair whose
     // constants mostly changed a lot is not the same thing (or a cut) and is
     // shown as it is.
-    std::unordered_map<uint64_t, std::deque<uint32_t>> by_key;
-    for (uint32_t i = 0; i < prev.draws.size(); ++i) by_key[prev.draws[i].key].push_back(i);
+    struct Group {
+        std::vector<uint32_t> prev;     // previous frame's draws with this key, in order
+        std::vector<uint8_t> paired;    // per entry of prev
+        uint32_t current = 0;           // this frame's draws with this key so far
+    };
+    std::unordered_map<uint64_t, Group> groups;
+    std::unordered_map<uint64_t, std::deque<uint32_t>> unchanged; // (key ^ constants) -> place in its group
+    for (uint32_t j = 0; j < prev.draws.size(); ++j) {
+        Group& g = groups[prev.draws[j].key];
+        unchanged[prev.draws[j].key ^ (prev.draws[j].hash * 0x9E3779B97F4A7C15ull)].push_back(
+            static_cast<uint32_t>(g.prev.size()));
+        g.prev.push_back(j);
+        g.paired.push_back(0);
+    }
+    std::vector<uint32_t> place(cur.draws.size(), 0); // among this frame's draws with its key
+    std::vector<Group*> group_of(cur.draws.size(), nullptr);
     uint32_t matched = 0, rejected = 0;
     for (uint32_t i = 0; i < cur.draws.size(); ++i) {
-        const auto it = by_key.find(cur.draws[i].key);
-        if (it == by_key.end() || it->second.empty()) continue;
-        const uint32_t j = it->second.front();
-        it->second.pop_front();
+        const auto it = groups.find(cur.draws[i].key);
+        if (it == groups.end()) continue;
+        Group& g = it->second;
+        group_of[i] = &g;
+        place[i] = g.current++;
+        const auto same = unchanged.find(cur.draws[i].key ^ (cur.draws[i].hash * 0x9E3779B97F4A7C15ull));
+        if (same == unchanged.end()) continue;
+        while (!same->second.empty() && g.paired[same->second.front()]) same->second.pop_front();
+        if (same->second.empty()) continue;
+        const uint32_t k = same->second.front();
+        same->second.pop_front();
+        g.paired[k] = 1;
+        match_[i] = static_cast<int32_t>(g.prev[k]);
         ++matched;
-        const Difference d = difference(cur, cur.draws[i], prev, prev.draws[j]);
-        if (d.large * 10 > d.compared) {
+    }
+    constexpr uint32_t kWindow = 16; // places searched either side
+    for (uint32_t i = 0; i < cur.draws.size(); ++i) {
+        Group* g = group_of[i];
+        if (g == nullptr || match_[i] >= 0) continue;
+        const uint32_t from = place[i] > kWindow ? place[i] - kWindow : 0;
+        const uint32_t to = std::min<uint32_t>(static_cast<uint32_t>(g->prev.size()), place[i] + kWindow + 1);
+        int32_t best = -1;
+        uint64_t best_cost = UINT64_MAX;
+        Difference best_d{};
+        for (uint32_t k = from; k < to; ++k) {
+            if (g->paired[k]) continue;
+            const Difference d = difference(cur, cur.draws[i], prev, prev.draws[g->prev[k]]);
+            // Fewest large changes, then fewest changes, then nearest.
+            const uint32_t distance = k > place[i] ? k - place[i] : place[i] - k;
+            const uint64_t cost = (uint64_t{d.large} << 40) | (uint64_t{d.changed} << 20) | distance;
+            if (cost < best_cost) {
+                best_cost = cost;
+                best = static_cast<int32_t>(k);
+                best_d = d;
+            }
+        }
+        if (best < 0) continue;
+        ++matched;
+        if (best_d.large * 10 > best_d.compared) {
             ++rejected;
             continue;
         }
-        match_[i] = static_cast<int32_t>(j);
+        g->paired[best] = 1;
+        match_[i] = static_cast<int32_t>(g->prev[best]);
     }
     static const bool test = std::getenv("TTT2_INTERP_TEST") != nullptr; // replay without blending
     replay_blend_ = !test && !cur.overflow && !prev.overflow && !cur.draws.empty() &&

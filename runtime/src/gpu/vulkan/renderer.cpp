@@ -395,6 +395,23 @@ void Renderer::capture() {
     captured_frame_ = static_cast<int64_t>(frame_number_);
     captured_index_ = index;
     ++index;
+    // TTT2_CAPTURE_SEQUENCE=<frames>: also every image shown for the next
+    // frames, in the order shown, as seq_<index>_<frame>_<n>.png (the real
+    // image is the last n of its frame).
+    static const uint32_t sequence = [] {
+        const char* v = std::getenv("TTT2_CAPTURE_SEQUENCE");
+        return v ? static_cast<uint32_t>(std::atoi(v)) : 0u;
+    }();
+    if (sequence_left_ == 0 && sequence > 0) {
+        sequence_left_ = sequence;
+        sequence_frame_ = 0;
+    }
+}
+
+void Renderer::save_sequence_image(uint32_t n) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/seq_%04u_%03u_%u.png", captured_index_, sequence_frame_, n);
+    save_image(scan_[0], std::string(std::getenv("TTT2_CAPTURE")) + name);
 }
 
 // ------------------------------------------------------------ profiling
@@ -493,6 +510,16 @@ void Renderer::swap() {
                      static_cast<unsigned long long>(blended_replays_),
                      static_cast<unsigned long long>(replays_), frame_records_[current_record_ ^ 1].used / 1e6,
                      replay_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1), match_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1));
+        if (!swap_delays_.empty()) {
+            std::sort(swap_delays_.begin(), swap_delays_.end());
+            const auto pct = [&](size_t p) { return swap_delays_[std::min(swap_delays_.size() - 1, swap_delays_.size() * p / 100)]; };
+            static const bool trace = std::getenv("TTT2_TRACE_PACING") != nullptr;
+            if (trace) {
+                std::fprintf(stderr, "pacing: swap after its vblank 50%% %.1f, 90%% %.1f, 99%% %.1f, max %.1f ms\n", pct(50),
+                             pct(90), pct(99), swap_delays_.back());
+            }
+            swap_delays_.clear();
+        }
         replay_seconds_ = match_seconds_ = 0;
         replays_ = blended_replays_ = 0;
         window_start_ = t;

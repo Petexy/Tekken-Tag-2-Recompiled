@@ -1,13 +1,15 @@
 // The display: a vertical blank every 1/59.94 s, as the Wii U drives the TV
-// and GamePad. A frame whose swap command has executed on the GPU flips at
-// the next vertical blank that respects the swap interval. Swap and flip
-// counts and times are what GX2GetSwapStatus reports; titles pace their
-// main loops on them.
+// and GamePad, or, when the window's display refreshes at a multiple of
+// 60 Hz, at every 60th of a second of its refreshes (host_vsync). A frame
+// whose swap command has executed on the GPU flips at the next vertical
+// blank that respects the swap interval. Swap and flip counts and times are
+// what GX2GetSwapStatus reports; titles pace their main loops on them.
 
 #include "gpu/gpu.h"
 #include "os/kernel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -34,27 +36,46 @@ void flip(uint64_t now) {
     g_last_flip_vsync = g_vsyncs;
 }
 
+// Steady-clock nanoseconds of the last host_vsync.
+std::atomic<int64_t> g_last_host_vsync{0};
+
+int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void vsync() {
+    os::KernelLock lock(os::kernel_mutex());
+    const uint64_t now = cafe_ppc_timebase();
+    ++g_vsyncs;
+    g_last_vsync = now;
+    if (g_frames_ready > g_flips && g_vsyncs - g_last_flip_vsync >= std::max<uint32_t>(g_swap_interval, 1)) {
+        flip(now);
+    }
+    os::wake(os::kWaitDisplay);
+}
+
 void display_main() {
     auto next = std::chrono::steady_clock::now();
     for (;;) {
         next += kRefreshPeriod;
         std::this_thread::sleep_until(next);
-        {
-            os::KernelLock lock(os::kernel_mutex());
-            const uint64_t now = cafe_ppc_timebase();
-            ++g_vsyncs;
-            g_last_vsync = now;
-            if (g_frames_ready > g_flips && g_vsyncs - g_last_flip_vsync >= std::max<uint32_t>(g_swap_interval, 1)) {
-                flip(now);
-            }
-            os::wake(os::kWaitDisplay);
+        // The host display's blanks stand in while they come.
+        if (steady_ns() - g_last_host_vsync.load() < 3 * kRefreshPeriod.count()) {
+            next = std::chrono::steady_clock::now();
+            continue;
         }
+        vsync();
         // Far behind (debugger, suspended process): resynchronise.
         if (std::chrono::steady_clock::now() - next > kRefreshPeriod * 10) next = std::chrono::steady_clock::now();
     }
 }
 
 } // namespace
+
+void host_vsync() {
+    g_last_host_vsync.store(steady_ns());
+    vsync();
+}
 
 void start_display() {
     std::thread(display_main).detach();

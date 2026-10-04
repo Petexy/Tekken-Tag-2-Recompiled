@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 namespace cafe::host {
@@ -112,14 +113,19 @@ bool open_window(const char* title) {
         g_display_width = static_cast<uint32_t>(mode->w * mode->pixel_density);
         g_display_height = static_cast<uint32_t>(mode->h * mode->pixel_density);
         if (const SDL_DisplayMode* current = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay())) {
-            g_display_refresh = current->refresh_rate;
+            g_display_refresh = current->refresh_rate_denominator
+                                    ? static_cast<float>(double(current->refresh_rate_numerator) / current->refresh_rate_denominator)
+                                    : current->refresh_rate;
         }
         const int fit = std::max(1, std::min((mode->w - 64) / 640, (mode->h - 128) / 360));
         window_w = 640 * fit;
         window_h = 360 * fit;
     }
+    // TTT2_FULLSCREEN=1 starts fullscreen (F11 toggles it).
+    const char* fullscreen = std::getenv("TTT2_FULLSCREEN");
     g_window = SDL_CreateWindow(title, window_w, window_h,
-                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                                    (fullscreen && *fullscreen == '1' ? SDL_WINDOW_FULLSCREEN : 0));
     if (g_window == nullptr) {
         std::fprintf(stderr, "ttt2: no window: %s\n", SDL_GetError());
         return false;

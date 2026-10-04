@@ -245,11 +245,18 @@ attachment formats and blend state.
   data (uniform blocks, buffer resources: camera, transforms, the
   characters' bone matrices, fetched by the vertex shaders) is copied into
   a GPU-visible record that the real draw reads too, and a replay blends
-  it with the previous frame's matching draw (same shaders, targets,
-  vertex count and first texture, in order), value by value where both
-  are ordinary floats. Draws whose data mostly jumps (a different object,
-  a cut) and frames where fewer than 80% of draws match are shown as they
-  are. Replays skip anything that writes guest memory (stream-out writes,
+  it with the previous frame's matching draw, value by value where both
+  are ordinary floats. Draws match by key (shaders, targets, vertex count
+  and first texture): first those whose data did not change, then each
+  with the most similar draw near its place among those with its key, so
+  sprites sharing a key keep their partners when others come and go (a
+  blinking cursor once paired every later menu sprite with its
+  neighbour). Only depth-tested (3D) draws blend: menus and the HUD place
+  parts of a widget with vertex data the CPU writes each frame, which a
+  replay cannot blend, so they are shown as the frame has them
+  (`TTT2_INTERP_2D=1` blends them too). Draws whose data mostly jumps (a
+  different object, a cut) and frames where fewer than 80% of draws match
+  are shown as they are. Replays skip anything that writes guest memory (stream-out writes,
   CPU-side surface copies); render targets a frame reads before writing
   them start replays from their start-of-frame content, and the next
   frame sees the real frame's. With unblended replays
@@ -260,11 +267,27 @@ attachment formats and blend state.
   compute queue (AMD's asynchronous compute, `TTT2_PRESENT_BLIT=1` for
   the rendering queue): a present there waits only for its own frame, not
   for rendering queued after it. A compute shader scales the frame,
-  letterboxed, into the swapchain. Frames get display slots one title
+  letterboxed, into the swapchain. On a display refreshing at a multiple
+  of 60 Hz with present waits (`VK_KHR_present_wait2`), the thread
+  presents at every refresh in FIFO order, three presents ahead of the
+  screen (KWin latches a commit about two refreshes before showing it, and
+  tells late that it did), and counts refreshes as each reaches the
+  screen: every 60th of a second of them is the title's vertical blank
+  (`gpu::host_vsync`; the 59.94 Hz timer stands in when they stop, e.g.
+  for a hidden window), and each frame's images are due at fixed
+  refreshes after the vblank its frame started from, the extra frames
+  first and the real one last. So the title runs at the display's own
+  rate (59.99 Hz on a 239.97 Hz display) and every image stays on screen
+  for the same number of refreshes: measured in fights at 2x on a 240 Hz
+  KWin desktop, 99% of images shown for exactly two refreshes (before,
+  frames timed by the clock alone came 6 to 11 ms apart). The lead from
+  vblank to the first image is what frames needed over the last ten
+  seconds, all but the slowest 1%, raised at once when frames keep coming
+  late (7-9 refreshes, ~30-37 ms, in fights). On other displays
+  (`TTT2_PRESENT_TIMED=1` forces it) frames get display slots one title
   frame apart (re-anchored when the title falls behind) at a lead after
-  their swap, the 98th percentile of how long frames take to finish on
-  the GPU; each slot shows the extra frames first and the real one last.
-  With interpolation the real image is shown half a frame later than
+  their swap and are presented at those times (mailbox). With
+  interpolation the real image is shown half a frame later than
   without.
 - Compiled SPIR-V and the Vulkan pipeline cache persist in
   `~/.cache/ttt2` (`$XDG_CACHE_HOME/ttt2`).
@@ -279,7 +302,8 @@ function is plain C++ registered with `CAFE_EXPORT(module, name, fn)`, and
 anything not implemented stops with the function's name and a guest
 backtrace. Iterating on the runtime rebuilds and relinks in ~2 s.
 
-The window shows the TV image (F11 toggles fullscreen). Keyboard: arrows
+The window shows the TV image (F11 toggles fullscreen, `TTT2_FULLSCREEN=1`
+starts in it). Keyboard: arrows
 D-pad, X/Z/S/A the A/B/X/Y buttons, Q/W L/R, 1/2 ZL/ZR, Enter +, Backspace
 −, H Home, I/J/K/L the left stick; SDL gamepads map by button position.
 `TTT2_GPU=null` runs headless without a window. Sound plays on the
@@ -303,6 +327,7 @@ per frame every ten seconds. Renderer debugging:
 | Variable | Effect |
 | --- | --- |
 | `TTT2_CAPTURE=<dir>` | TV/GamePad images as PNG every `TTT2_CAPTURE_INTERVAL` seconds (default 5) |
+| `TTT2_CAPTURE_SEQUENCE=<n>` | with `TTT2_CAPTURE`, also every image shown for the next n frames after each capture, in order (`seq_<capture>_<frame>_<n>.png`, the real image last) |
 | `TTT2_TRACE_AT=<s>`, `TTT2_TRACE_FRAME=<n>` | log every command of one frame; with `TTT2_CAPTURE`, save all its render targets |
 | `TTT2_INPUT_SCRIPT="25:plus,26.5:a"` | press GamePad buttons at given seconds, for unattended runs |
 | `TTT2_DUMP_SHADERS=<dir>` | shader binaries, draw registers and generated GLSL |
@@ -312,7 +337,11 @@ per frame every ten seconds. Renderer debugging:
 | `TTT2_SCALE=1..4` | render scale of screen-sized targets (default from the display) |
 | `TTT2_FPS=60/120/180/240` | frames shown per second (default 120 on displays of 100 Hz and more) |
 | `TTT2_INTERP_TEST=1` | replays without blending: extra frames must equal real ones |
-| `TTT2_TRACE_INTERP=1`, `TTT2_TRACE_PACING=1` | draw matching, carried targets; frame readiness |
+| `TTT2_INTERP_2D=1` | blend flat (not depth-tested) draws too |
+| `TTT2_PRESENT_TIMED=1` | present at chosen times instead of at every refresh |
+| `TTT2_PRESENT_QUEUE=1..4` | presents kept ahead of the screen when presenting every refresh (default 3) |
+| `TTT2_FULLSCREEN=1` | start fullscreen |
+| `TTT2_TRACE_INTERP=1`, `TTT2_TRACE_PACING=1` | draw matching, carried targets; frame readiness, swap times after the vblank |
 | `TTT2_PROFILE_AT=<s>` | GPU time of every operation of one frame |
 | `TTT2_VK_VALIDATION=1` | Khronos validation layer, if installed (synchronization checks: `khronos_validation.validate_sync = true` in a file named by `VK_LAYER_SETTINGS_PATH`) |
 | `TTT2_AUDIO_DUMP=<file.wav>` | everything played, as 48 kHz stereo WAV (also without a device) |

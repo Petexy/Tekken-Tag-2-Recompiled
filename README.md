@@ -54,9 +54,12 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
   game renders, drawn from the same frame with camera, objects and
   character skeletons blended halfway; the game's 60 Hz logic, physics
   and hitboxes are untouched. Screen-sized buffers render at a multiple
-  of 720p (2x = 2560x1440 by default on a 1440p display). On an RX 9060
-  XT fights run at a steady 59.9 game frames and ~120 shown frames per
-  second at 2x, with frames 8.3 ms apart.
+  of 720p (2x = 2560x1440 by default on a 1440p display). On a display
+  refreshing at a multiple of 60 Hz the game's clock follows the
+  display's refreshes and every image stays on screen equally long: on an
+  RX 9060 XT with a 240 Hz display, fights run at 60 game frames and 120
+  shown frames per second at 2x, 99% of images shown for exactly two
+  refreshes.
 - The renderer (`runtime/src/gpu/vulkan/`) translates the game's Latte
   shaders to GLSL/SPIR-V (`runtime/src/latte/`), reads vertex and uniform
   data from guest memory in place, detiles textures with AMD's address

@@ -46,6 +46,11 @@ struct Context {
     VkPhysicalDeviceMemoryProperties memory{};
     bool custom_border_color = false;
     bool validation = false;
+    // VK_KHR_present_wait2: the presentation thread learns when each image
+    // reaches the screen (surface support is checked separately).
+    bool present_wait = false;
+    bool surface_capabilities2 = false; // VK_KHR_get_surface_capabilities2
+    PFN_vkWaitForPresent2KHR wait_for_present = nullptr;
 
     PFN_vkGetMemoryHostPointerPropertiesEXT get_memory_host_pointer_properties = nullptr;
     PFN_vkCmdPushDescriptorSetKHR cmd_push_descriptor_set = nullptr;

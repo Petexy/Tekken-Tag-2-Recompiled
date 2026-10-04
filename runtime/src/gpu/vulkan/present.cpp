@@ -9,6 +9,16 @@
 // intervals: the extra frames of a frame first, its real image last,
 // 1/(59.94 * frames_per_frame_) s apart.
 //
+// When the display refreshes at a multiple of 60 Hz (and the driver tells
+// when presents reach the screen: present waits), presentation follows the
+// display instead: the thread presents at every refresh in FIFO order, the
+// title's vblanks come from every 60th of a second of those refreshes, and
+// each frame's images are due at fixed refreshes after the vblank its frame
+// started from (present_every_refresh). So on a fixed-rate display every
+// image stays on screen for the same number of refreshes, with nothing
+// drifting against the display. Otherwise frames are shown at times
+// (present_timed).
+//
 // Presentation runs on a queue of its own, a compute queue (AMD's
 // asynchronous compute), with a small compute shader doing the scaling: on
 // the rendering queue a present waits for everything submitted before it,
@@ -17,29 +27,34 @@
 
 #include "gpu/vulkan/renderer.h"
 
+#include "gpu/gpu.h"
 #include "host/window.h"
 
 #include "cafe/runtime.h"
 
 #include <algorithm>
 #include <chrono>
-#include <vector>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <shaderc/shaderc.h>
 #include <thread>
+#include <vector>
 
 namespace cafe::gpu::vk {
 namespace {
 
-constexpr uint32_t kPresentImages = 8;
+// Enough for every image waiting for its refresh (up to a frame's lead
+// ahead), the one showing and the one being copied.
+constexpr uint32_t kPresentImages = 12;
 // One frame of the title: the console's 59.94 Hz.
 constexpr double kFramePeriod = 1001.0 / 60000.0;
 
 double now_seconds() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
 
 } // namespace
 
@@ -72,9 +87,41 @@ void Renderer::start_presenter() {
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx_.physical, surface_, &caps));
     compute_present_ = supported && ctx_.storage_without_format && (caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) &&
                        !std::getenv("TTT2_PRESENT_BLIT");
+    // Presenting every refresh: present waits on this surface, and a
+    // display refreshing a whole number of times per title frame that the
+    // frame's images divide evenly.
+    bool waits = false;
+    if (ctx_.present_wait) {
+        const auto get_caps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
+            vkGetInstanceProcAddr(ctx_.instance, "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+        VkSurfaceCapabilitiesPresentWait2KHR wait2{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR};
+        VkSurfaceCapabilitiesPresentId2KHR id2{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR};
+        id2.pNext = &wait2;
+        VkSurfaceCapabilities2KHR caps2{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+        caps2.pNext = &id2;
+        VkPhysicalDeviceSurfaceInfo2KHR info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
+        info.surface = surface_;
+        waits = get_caps2 != nullptr && get_caps2(ctx_.physical, &info, &caps2) == VK_SUCCESS && id2.presentId2Supported &&
+                wait2.presentWait2Supported;
+    }
+    const double hz = host::display_refresh_rate();
+    const uint32_t per_frame = static_cast<uint32_t>(std::lround(hz / 60.0));
+    every_refresh_ = waits && per_frame >= 1 && std::fabs(hz / 60.0 - per_frame) < 0.01 * per_frame &&
+                     per_frame % frames_per_frame_ == 0 && !std::getenv("TTT2_PRESENT_TIMED");
+    if (every_refresh_) {
+        refreshes_per_frame_ = per_frame;
+        refresh_period_ = 1.0 / hz;
+        // Adapted to what frames need from the first frames on.
+        refresh_lead_.store(static_cast<int32_t>(per_frame + 2));
+    }
     present_family_ = compute_present_ ? ctx_.present_family : ctx_.queue_family;
     present_queue_handle_ = compute_present_ ? ctx_.present_queue : ctx_.queue;
-    std::fprintf(stderr, "ttt2: GPU: presenting from %s\n", compute_present_ ? "a compute queue" : "the rendering queue");
+    std::fprintf(stderr, "ttt2: GPU: presenting from %s", compute_present_ ? "a compute queue" : "the rendering queue");
+    if (every_refresh_) {
+        std::fprintf(stderr, ", every refresh of a %.2f Hz display (%u per title frame)\n", hz, refreshes_per_frame_);
+    } else {
+        std::fprintf(stderr, " at times (a %.2f Hz display%s)\n", hz, waits ? "" : ", no present waits");
+    }
     if (compute_present_) {
         shaderc_compile_options_t options = shaderc_compile_options_initialize();
         shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
@@ -157,7 +204,15 @@ uint32_t Renderer::take_present_image() {
         }
         present_free_.assign(kPresentImages, 1);
     }
-    present_cv_.wait(lock, [&] { return std::find(present_free_.begin(), present_free_.end(), 1) != present_free_.end(); });
+    // None free (the display stalled: a hidden window): the oldest image
+    // still waiting to be shown, which a newer one supersedes anyway.
+    const auto free = [&] { return std::find(present_free_.begin(), present_free_.end(), 1) != present_free_.end(); };
+    if (!present_cv_.wait_for(lock, std::chrono::milliseconds(20), free) && !present_queue_.empty()) {
+        const uint32_t i = present_queue_.front().image;
+        present_queue_.pop_front();
+        return i;
+    }
+    present_cv_.wait(lock, free);
     const uint32_t i = static_cast<uint32_t>(std::find(present_free_.begin(), present_free_.end(), 1) - present_free_.begin());
     present_free_[i] = 0;
     return i;
@@ -179,10 +234,38 @@ uint32_t Renderer::copy_scan_to_present_image(uint64_t& ready) {
     return i;
 }
 
-void Renderer::queue_present(uint32_t image, double time, uint64_t ready) {
+void Renderer::queue_present(const QueuedFrame& f) {
     std::lock_guard lock(present_mutex_);
-    present_queue_.push_back({image, time, ready, slot_reference_});
+    present_queue_.push_back(f);
     present_cv_.notify_all();
+}
+
+void Renderer::queue_present(uint32_t image, double time, uint64_t ready) {
+    QueuedFrame f{};
+    f.image = image;
+    f.time = time;
+    f.ready = ready;
+    f.reference = slot_reference_;
+    queue_present(f);
+}
+
+// Presenting every refresh: image `n` of the frame (its extra frames first,
+// its real image last) is due n refresh steps after the frame's first
+// image, which is due a lead after the title vblank the frame started from.
+int64_t Renderer::frame_due() {
+    frame_base_tick_ = tick_refresh_.load();
+    swap_delays_.push_back(static_cast<float>((now_seconds() - tick_time_.load()) * 1000.0));
+    return frame_base_tick_ + refresh_lead_.load();
+}
+
+void Renderer::queue_frame_image(uint32_t image, uint64_t ready, uint32_t n) {
+    QueuedFrame f{};
+    f.image = image;
+    f.ready = ready;
+    f.due = frame_base_due_ + int64_t{n} * (refreshes_per_frame_ / frames_per_frame_);
+    f.tick = frame_base_tick_;
+    f.first = n == 0;
+    queue_present(f);
 }
 
 // Frame pacing. Every frame the title renders gets a display slot: one
@@ -208,13 +291,31 @@ double Renderer::frame_slot() {
 // interpolation, after the extra frames the replays render.
 void Renderer::show_frame() {
     if (!scan_valid_[0]) return;
+    sequence_saving_ = sequence_left_ > 0;
+    if (sequence_saving_) {
+        --sequence_left_;
+        ++sequence_frame_;
+        save_sequence_image(frames_per_frame_);
+    }
     uint64_t ready = 0;
     const uint32_t image = copy_scan_to_present_image(ready);
     if (frames_per_frame_ == 1) {
-        queue_present(image, frame_slot(), ready);
+        if (every_refresh_) {
+            frame_base_due_ = frame_due();
+            queue_frame_image(image, ready, 0);
+        } else {
+            queue_present(image, frame_slot(), ready);
+        }
         return;
     }
-    if (pending_real_ != UINT32_MAX) queue_present(pending_real_, frame_slot(), pending_ready_); // a frame without replays
+    if (pending_real_ != UINT32_MAX) { // a frame without replays
+        if (every_refresh_) {
+            frame_base_due_ = frame_due();
+            queue_frame_image(pending_real_, pending_ready_, frames_per_frame_ - 1);
+        } else {
+            queue_present(pending_real_, frame_slot(), pending_ready_);
+        }
+    }
     pending_real_ = image;
     pending_ready_ = ready;
     extra_frames_ = 0;
@@ -232,17 +333,28 @@ void Renderer::show_extra_frame() {
             save_image(scan_[0], std::string(dir) + name);
         }
     }
+    if (sequence_saving_) save_sequence_image(extra_frames_ + 1);
     uint64_t ready = 0;
     const uint32_t image = copy_scan_to_present_image(ready);
-    if (extra_frames_ == 0) frame_base_time_ = frame_slot();
-    queue_present(image, frame_base_time_ + extra_frames_ * kFramePeriod / frames_per_frame_, ready);
+    if (every_refresh_) {
+        if (extra_frames_ == 0) frame_base_due_ = frame_due();
+        queue_frame_image(image, ready, extra_frames_);
+    } else {
+        if (extra_frames_ == 0) frame_base_time_ = frame_slot();
+        queue_present(image, frame_base_time_ + extra_frames_ * kFramePeriod / frames_per_frame_, ready);
+    }
     ++extra_frames_;
 }
 
 void Renderer::finish_frame_presentation() {
     if (pending_real_ == UINT32_MAX) return;
-    const double time = extra_frames_ ? frame_base_time_ + extra_frames_ * kFramePeriod / frames_per_frame_ : frame_slot();
-    queue_present(pending_real_, time, pending_ready_);
+    if (every_refresh_) {
+        if (extra_frames_ == 0) frame_base_due_ = frame_due();
+        queue_frame_image(pending_real_, pending_ready_, frames_per_frame_ - 1);
+    } else {
+        const double time = extra_frames_ ? frame_base_time_ + extra_frames_ * kFramePeriod / frames_per_frame_ : frame_slot();
+        queue_present(pending_real_, time, pending_ready_);
+    }
     pending_real_ = UINT32_MAX;
 }
 
@@ -279,6 +391,11 @@ void Renderer::note_presentation(double scheduled, double presented) {
 
 void Renderer::presenter_main() {
     pthread_setname_np(pthread_self(), "present");
+    if (every_refresh_) present_every_refresh();
+    else present_timed();
+}
+
+void Renderer::present_timed() {
     for (;;) {
         QueuedFrame f;
         {
@@ -336,6 +453,191 @@ void Renderer::presenter_main() {
     }
 }
 
+// Presenting every refresh. FIFO presentation shows one image per refresh
+// and drops none; the thread keeps kQueued presents ahead of the screen
+// and, each time one reaches it (a present wait), queues the next: the
+// newest complete image due at the refresh it will show at, else the one
+// already showing again. Every refreshes_per_frame_-th refresh reaching the
+// screen is a title vblank; a frame's images are due a lead after the
+// vblank its frame started from, the lead being what frames have needed
+// (all but the slowest 1% over the last ten seconds, more at once when
+// frames keep coming late).
+void Renderer::present_every_refresh() {
+    static const size_t kQueued = [] {
+        const char* v = std::getenv("TTT2_PRESENT_QUEUE");
+        return v ? static_cast<size_t>(std::clamp(std::atoi(v), 1, 4)) : size_t{3};
+    }();
+    const int64_t per_frame = refreshes_per_frame_;
+    std::deque<uint64_t> in_flight; // presents not yet seen on screen
+    uint64_t next_id = 1, generation = swapchain_generation_;
+    int64_t refresh = 0;  // the refresh the last present seen on screen showed at
+    double seen_at = 0;   // when it was seen there
+    int64_t last_tick = -1;
+    uint32_t showing = UINT32_MAX; // the image presented last
+    uint64_t showing_ready = 0;
+    int64_t showing_from = 0;
+    // Statistics, every ten seconds.
+    uint32_t refreshes = 0, images = 0, late = 0, missed = 0, dropped = 0, stalls = 0;
+    uint32_t lengths[4] = {};
+    double window = now_seconds();
+    std::vector<int32_t> needs;     // refreshes from a frame's vblank until its first image was complete
+    std::deque<int64_t> late_frames; // when frames needed more than the lead
+    static const bool trace = std::getenv("TTT2_TRACE_PACING") != nullptr;
+    for (;;) {
+        // The first image (it sets the swapchain's format and size).
+        if (showing == UINT32_MAX) {
+            std::unique_lock lock(present_mutex_);
+            present_cv_.wait(lock, [&] { return !present_queue_.empty(); });
+            const QueuedFrame f = present_queue_.front();
+            present_queue_.pop_front();
+            lock.unlock();
+            VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &timeline_;
+            wi.pValues = &f.ready;
+            VK_CHECK(vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull));
+            showing = f.image;
+            showing_ready = f.ready;
+        }
+        if (generation != swapchain_generation_) { // presents to an old swapchain are gone
+            generation = swapchain_generation_;
+            in_flight.clear();
+            seen_at = 0;
+        }
+        if (in_flight.size() >= kQueued) {
+            VkPresentWait2InfoKHR wi{VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR};
+            wi.presentId = in_flight.front();
+            wi.timeout = 100'000'000; // ns
+            const VkResult r = ctx_.wait_for_present(ctx_.device, swapchain_, &wi);
+            if (r == VK_TIMEOUT) {
+                // Not reaching the screen (a hidden window): the title's own
+                // timer takes over its vblanks; keep only the newest image.
+                ++stalls;
+                seen_at = 0;
+                std::lock_guard lock(present_mutex_);
+                uint64_t done = 0;
+                VK_CHECK(vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done));
+                while (!present_queue_.empty() && done >= present_queue_.front().ready) {
+                    present_free_[showing] = 1;
+                    showing = present_queue_.front().image;
+                    showing_ready = present_queue_.front().ready;
+                    present_queue_.pop_front();
+                }
+                present_cv_.notify_all();
+                continue;
+            }
+            in_flight.pop_front();
+            if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
+                in_flight.clear();
+                seen_at = 0;
+            } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+                check_failed("vkWaitForPresent2KHR", r, __FILE__, __LINE__);
+            } else {
+                // Refreshes since the last one seen: more than one means a
+                // present came too late for its refresh.
+                const double t = now_seconds();
+                const int64_t steps =
+                    seen_at == 0 ? 1 : std::max<int64_t>(1, std::llround((t - seen_at) / refresh_period_));
+                if (seen_at != 0) missed += static_cast<uint32_t>(steps - 1);
+                refresh += steps;
+                seen_at = t;
+                refreshes += static_cast<uint32_t>(steps);
+            }
+        }
+        // The title's vblank, at every per_frame-th refresh.
+        if (const int64_t tick = refresh / per_frame * per_frame; tick > last_tick) {
+            last_tick = tick;
+            tick_time_.store(seen_at);
+            tick_refresh_.store(tick);
+            gpu::host_vsync();
+        }
+        // The refresh the next present shows at, and its image.
+        const int64_t at = refresh + static_cast<int64_t>(in_flight.size()) + 1;
+        {
+            uint64_t done = 0;
+            VK_CHECK(vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done));
+            std::lock_guard lock(present_mutex_);
+            int32_t chosen = -1;
+            for (size_t i = 0; i < present_queue_.size(); ++i) {
+                QueuedFrame& f = present_queue_[i];
+                if (!f.seen_ready && done >= f.ready) {
+                    f.seen_ready = true;
+                    if (f.first) {
+                        const int32_t need = static_cast<int32_t>(std::max<int64_t>(0, at - f.tick));
+                        // Stalls (loading) over two frames are not measures.
+                        if (need <= 3 * per_frame + static_cast<int32_t>(kQueued)) {
+                            needs.push_back(need);
+                            // Late more than once in the last second: more lead
+                            // now (a single late frame, such as one compiling a
+                            // shader, is not worth the latency).
+                            if (need > refresh_lead_.load()) {
+                                late_frames.push_back(at);
+                                while (!late_frames.empty() && late_frames.front() < at - 60 * per_frame) {
+                                    late_frames.pop_front();
+                                }
+                                if (late_frames.size() >= 2) {
+                                    refresh_lead_.store(need);
+                                    late_frames.clear();
+                                }
+                            }
+                        }
+                    }
+                }
+                if (f.due == at && !f.seen_ready) ++late;
+                if (f.due <= at && f.seen_ready) chosen = static_cast<int32_t>(i);
+            }
+            if (chosen >= 0) {
+                for (int32_t i = 0; i < chosen; ++i) {
+                    present_free_[present_queue_[i].image] = 1;
+                    ++dropped;
+                }
+                if (showing != UINT32_MAX) {
+                    present_free_[showing] = 1;
+                    ++lengths[std::clamp<int64_t>(at - showing_from, 1, 4) - 1];
+                    ++images;
+                }
+                showing = present_queue_[chosen].image;
+                showing_ready = present_queue_[chosen].ready;
+                showing_from = at;
+                present_queue_.erase(present_queue_.begin(), present_queue_.begin() + chosen + 1);
+                present_cv_.notify_all();
+            }
+        }
+        if (present_image(showing, showing_ready, next_id)) {
+            in_flight.push_back(next_id++);
+        } else {
+            in_flight.clear(); // a new swapchain (or none, minimised)
+            seen_at = 0;
+            std::this_thread::sleep_for(std::chrono::duration<double>(refresh_period_));
+        }
+
+        const double now = now_seconds();
+        if (now - window >= 10.0) {
+            // The lead: what the last ten seconds' frames needed, all but
+            // the slowest 1%.
+            std::sort(needs.begin(), needs.end());
+            if (needs.size() >= 100) refresh_lead_.store(std::max(needs[needs.size() * 99 / 100], 1));
+            const uint32_t shown = std::max(1u, lengths[0] + lengths[1] + lengths[2] + lengths[3]);
+            std::fprintf(stderr,
+                         "ttt2: present: %.1f refreshes/s, %.1f images/s shown for 1/2/3/4+ refreshes: "
+                         "%.1f/%.1f/%.1f/%.1f%%; %u late, %u missed refreshes, %u dropped%s; lead %d refreshes (%.1f ms)\n",
+                         refreshes / (now - window), images / (now - window), 100.0 * lengths[0] / shown,
+                         100.0 * lengths[1] / shown, 100.0 * lengths[2] / shown, 100.0 * lengths[3] / shown, late, missed,
+                         dropped, stalls ? ", stalled" : "", refresh_lead_.load(),
+                         refresh_lead_.load() * refresh_period_ * 1000.0);
+            if (trace && !needs.empty()) {
+                const auto at_pct = [&](size_t p) { return needs[std::min(needs.size() - 1, needs.size() * p / 100)]; };
+                std::fprintf(stderr, "pacing: need 50%% %d, 90%% %d, 99%% %d, max %d refreshes\n", at_pct(50), at_pct(90),
+                             at_pct(99), needs.back());
+            }
+            needs.clear();
+            refreshes = images = late = missed = dropped = stalls = 0;
+            std::fill(std::begin(lengths), std::end(lengths), 0u);
+            window = now;
+        }
+    }
+}
+
 void Renderer::create_swapchain(VkFormat image_format) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx_.physical, surface_, &caps));
@@ -361,14 +663,17 @@ void Renderer::create_swapchain(VkFormat image_format) {
     vkGetPhysicalDeviceSurfacePresentModesKHR(ctx_.physical, surface_, &mode_count, nullptr);
     std::vector<VkPresentModeKHR> modes(mode_count);
     vkGetPhysicalDeviceSurfacePresentModesKHR(ctx_.physical, surface_, &mode_count, modes.data());
-    // Frames are presented at chosen times: show each at the next refresh.
+    // Presenting every refresh: FIFO, one image per refresh. Else frames are
+    // presented at chosen times: show each at the next refresh.
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    for (VkPresentModeKHR m : modes) {
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
-    }
-    if (mode == VK_PRESENT_MODE_FIFO_KHR) {
+    if (!every_refresh_) {
         for (VkPresentModeKHR m : modes) {
-            if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
+            if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
+        }
+        if (mode == VK_PRESENT_MODE_FIFO_KHR) {
+            for (VkPresentModeKHR m : modes) {
+                if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
+            }
         }
     }
     uint32_t width, height;
@@ -381,8 +686,10 @@ void Renderer::create_swapchain(VkFormat image_format) {
     height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
 
     VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    if (every_refresh_) sci.flags = VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
     sci.surface = surface_;
-    sci.minImageCount = std::max(caps.minImageCount, 3u);
+    // Every refresh: two queued, one on screen, one being written.
+    sci.minImageCount = std::max(caps.minImageCount, every_refresh_ ? 5u : 3u);
     if (caps.maxImageCount) sci.minImageCount = std::min(sci.minImageCount, caps.maxImageCount);
     sci.imageFormat = chosen.format;
     sci.imageColorSpace = chosen.colorSpace;
@@ -410,6 +717,7 @@ void Renderer::create_swapchain(VkFormat image_format) {
         vkDestroySwapchainKHR(ctx_.device, swapchain_, nullptr);
     }
     swapchain_ = swapchain;
+    ++swapchain_generation_;
     swapchain_format_ = chosen.format;
     swapchain_extent_ = sci.imageExtent;
     vkGetSwapchainImagesKHR(ctx_.device, swapchain_, &count, nullptr);
@@ -436,11 +744,11 @@ void Renderer::create_swapchain(VkFormat image_format) {
     }
 }
 
-void Renderer::present_image(uint32_t i, uint64_t ready) {
+bool Renderer::present_image(uint32_t i, uint64_t ready, uint64_t present_id) {
     const Image& src = present_images_[i];
     uint32_t width, height;
     host::drawable_size(width, height);
-    if (width == 0 || height == 0) return; // minimised
+    if (width == 0 || height == 0) return false; // minimised
     const bool srgb_image = src.format == VK_FORMAT_R8G8B8A8_SRGB || src.format == VK_FORMAT_B8G8R8A8_SRGB;
     const bool srgb_chain = swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB || swapchain_format_ == VK_FORMAT_R8G8B8A8_SRGB;
     if (swapchain_ == VK_NULL_HANDLE || width != swapchain_extent_.width || height != swapchain_extent_.height ||
@@ -448,11 +756,12 @@ void Renderer::present_image(uint32_t i, uint64_t ready) {
         create_swapchain(src.format);
     }
     uint32_t index = 0;
-    VkResult r = vkAcquireNextImageKHR(ctx_.device, swapchain_, UINT64_MAX, acquired_, VK_NULL_HANDLE, &index);
+    VkResult r = vkAcquireNextImageKHR(ctx_.device, swapchain_, 100'000'000, acquired_, VK_NULL_HANDLE, &index);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         create_swapchain(src.format);
-        return;
+        return false;
     }
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) return false;
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) check_failed("vkAcquireNextImageKHR", r, __FILE__, __LINE__);
     VkImage image = swapchain_images_[index];
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -540,6 +849,12 @@ void Renderer::present_image(uint32_t i, uint64_t ready) {
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain_;
     pi.pImageIndices = &index;
+    VkPresentId2KHR id{VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR};
+    if (present_id != 0) {
+        id.swapchainCount = 1;
+        id.pPresentIds = &present_id;
+        pi.pNext = &id;
+    }
     if (compute_present_) {
         VK_CHECK(vkQueueSubmit(present_queue_handle_, 1, &si, present_fence_));
         r = vkQueuePresentKHR(present_queue_handle_, &pi);
@@ -553,9 +868,10 @@ void Renderer::present_image(uint32_t i, uint64_t ready) {
     VK_CHECK(vkResetCommandPool(ctx_.device, present_pool_, 0));
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
         create_swapchain(src.format);
-    } else if (r != VK_SUCCESS) {
-        check_failed("vkQueuePresentKHR", r, __FILE__, __LINE__);
+        return r == VK_SUBOPTIMAL_KHR && present_id == 0;
     }
+    if (r != VK_SUCCESS) check_failed("vkQueuePresentKHR", r, __FILE__, __LINE__);
+    return true;
 }
 
 } // namespace cafe::gpu::vk
