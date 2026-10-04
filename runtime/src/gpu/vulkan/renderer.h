@@ -31,8 +31,13 @@
 #include "latte/translate.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -64,6 +69,15 @@ struct Target {
     Image image;
     uint64_t written = 0;   // event stamp of the last GPU write
     uint64_t overwritten = 0; // event stamp of the last CPU write to its memory
+    uint32_t end = 0;       // first byte past its memory
+    // Interpolation: targets read in a frame before it writes them carry
+    // content between frames; replays start from their content at the
+    // start of the frame, and the next frame gets the real frame's.
+    uint64_t written_frame = 0; // frame_number_ of the last write by a real frame
+    bool carried = false;       // read before written in this frame
+    bool start_copied = false;  // start_copy holds this frame's start
+    bool rewrites = false;      // was rewritten after being carried before: copy its start
+    Image start_copy, end_copy;
 };
 
 struct Texture {
@@ -111,15 +125,26 @@ public:
     void invalidate(uint32_t address, uint32_t size, uint32_t coherency_flags) override;
     void cpu_wrote(uint32_t address, uint32_t size) override;
     void sync() override;
+    uint64_t flush() override;
+    void wait_for(uint64_t value) override;
+    uint32_t frames_per_frame() const override { return frames_per_frame_; }
+    void begin_replay(uint32_t n) override;
+    void end_replay() override;
+    void frame_shown() override;
 
 private:
     // ----------------------------------------------------- commands (renderer.cpp)
     VkCommandBuffer cmd();
-    void submit(bool wait);
+    // Ends the command buffer being recorded and submits it; returns the
+    // timeline value that signals its completion. With `wait`, waits for
+    // every submission so far.
+    uint64_t submit(bool wait);
+    void wait_value(uint64_t value);
     void barrier();
     uint8_t* upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset);
+    // `shared`: used by the presentation queue too (concurrent sharing).
     Image create_image(VkFormat format, VkImageAspectFlags aspect, uint32_t width, uint32_t height, uint32_t layers,
-                       uint32_t levels, VkImageUsageFlags usage, VkImageViewType view_type);
+                       uint32_t levels, VkImageUsageFlags usage, VkImageViewType view_type, bool shared = false);
     void destroy_image(Image& image);
     void end_rendering();
     uint64_t stamp() { return ++events_; }
@@ -141,9 +166,11 @@ private:
     Texture* texture(const uint32_t words[7]);
     void create_texture_image(Texture& t, uint32_t scale);
     void load_texture(Texture& t);
+    void mark_textures_dirty(uint32_t address, uint64_t end);
     bool load_texture_from_targets(Texture& t);
     void copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height);
     VkSampler sampler(const uint32_t words[3], const float border[4], bool compare);
+    Buffer depth_staging_; // video memory for depth -> texture copies
 
     // ---------------------------------------------------- draws (draw.cpp)
     const ShaderModule* shader(latte::Stage stage, uint32_t address, uint32_t size, uint32_t fetch_address,
@@ -155,22 +182,154 @@ private:
                              const VkFormat* colors, uint32_t color_count, VkFormat depth, uint32_t topology_class);
     latte::abi::Buffer buffer_descriptor(uint32_t address, uint32_t size, uint32_t stride) const;
 
-    // -------------------------------------------------- presentation (renderer.cpp)
+    // ---------------------------------------- interpolation (interpolate.cpp)
+public: // record types, shared with interpolate.cpp's helpers
+    struct ConstantSource {
+        uint8_t stage; // 0 vertex, 1 pixel
+        uint8_t kind;  // 0 uniform block, 1 buffer resource
+        uint8_t index;
+        uint32_t address, size, stride;
+    };
+    struct ConstantSources {
+        ConstantSource slots[64];
+        uint32_t count = 0;
+        void add(const ConstantSource& s) {
+            if (count < 64 && s.size != 0) slots[count++] = s;
+        }
+        const ConstantSource* begin() const { return slots; }
+        const ConstantSource* end() const { return slots + count; }
+    };
+    struct SlotRecord {
+        uint8_t stage, kind, index;
+        uint32_t offset, size, stride;
+        bool big_endian;
+        uint64_t hash; // of the contents
+    };
+    struct DrawRecord {
+        uint64_t key;
+        uint32_t first_slot, slot_count;
+        uint64_t hash; // of all its constants
+    };
+    // A frame's draws and the constant data they read, copied into
+    // GPU-visible memory: the frame's own draws read it there too, so a
+    // replay sees exactly what the frame saw.
+    struct FrameRecord {
+        std::vector<DrawRecord> draws;
+        std::vector<SlotRecord> slots;
+        Buffer data;
+        size_t used = 0;
+        struct Snapshot {
+            uint32_t offset;
+            bool big_endian;
+            uint64_t hash;
+        };
+        std::map<uint64_t, Snapshot> snapshots; // (address << 32 | size) -> copy in data
+        bool overflow = false;
+        void clear();
+    };
+    struct Difference {
+        uint32_t changed, large, compared;
+    };
+
+private:
+    Difference difference(const FrameRecord& a_frame, const DrawRecord& a, const FrameRecord& b_frame,
+                          const DrawRecord& b) const;
+    void init_interpolation();
+    uint32_t begin_draw_record(const Registers& regs, const Draw& d);
+    static constexpr uint32_t kMaxSnapshot = 256u << 10;
+    bool snapshot(uint32_t address, uint32_t size, uint32_t& offset, bool& swapped, uint64_t& hash);
+    void record_constants(uint32_t draw_index, const ConstantSources& sources, latte::abi::DrawConstants& dc);
+    void replace_constants(uint32_t draw_index, latte::abi::DrawConstants& dc);
+    uint32_t frames_per_frame_ = 1; // frames shown per frame the title renders
+    bool replaying_ = false;
+    float replay_t_ = 1.0f;          // blend position: 0 the previous frame, 1 this one
+    bool replay_blend_ = false;
+    uint32_t replay_draw_ = 0;
+    FrameRecord frame_records_[2];
+    uint64_t record_value_[2] = {}; // last submission reading each record
+    int current_record_ = 0;
+    std::vector<int32_t> match_;     // this frame's draw -> previous frame's, -1 none
+    std::unordered_map<uint64_t, VkDeviceAddress> blended_; // (previous, current offset) -> blend in the ring
+    void forget_snapshots(uint32_t address, uint32_t size);
+    void note_target_written(const Target* t);
+    void note_target_read(const Target* t);
+    void copy_image(const Image& src, const Image& dst);
+    std::vector<Target*> carried_; // this frame's carried targets
+    uint64_t replays_ = 0, blended_replays_ = 0;
+    double match_seconds_ = 0, replay_seconds_ = 0;
+    std::chrono::steady_clock::time_point replay_started_;
+
+    // ----------------------------------------------- presentation (present.cpp)
+    void start_presenter();
+    uint32_t take_present_image();
+    uint32_t copy_scan_to_present_image(uint64_t& ready);
+    void queue_present(uint32_t image, double time, uint64_t ready);
+    void show_frame();
+    void show_extra_frame();
+    void finish_frame_presentation();
+    void presenter_main();
+    void note_presentation(double scheduled, double presented);
+    void create_swapchain(VkFormat image_format);
+    void present_image(uint32_t index, uint64_t ready);
+    std::mutex queue_mutex_; // vkQueueSubmit and vkQueuePresentKHR from either thread
+    std::mutex present_mutex_;
+    std::condition_variable present_cv_;
+    struct QueuedFrame {
+        uint32_t image;
+        double time;    // steady clock seconds
+        uint64_t ready; // timeline value at which the image is complete
+        double reference; // when its slot was chosen (the frame's swap)
+    };
+    std::deque<QueuedFrame> present_queue_;
+    std::vector<Image> present_images_;
+    std::vector<uint8_t> present_free_;
+    uint32_t pending_real_ = UINT32_MAX; // interpolation: this frame's image, shown after its extra frames
+    uint64_t pending_ready_ = 0;
+    uint32_t extra_frames_ = 0;
+    double frame_base_time_ = 0;
+    double frame_slot();
+    double last_slot_ = 0;                    // display time of the last frame's slot (GPU thread)
+    double slot_reference_ = 0;               // when the last slot was chosen
+    std::atomic<double> present_lead_{0.004}; // swap to slot, adapted by the presentation thread
+    bool compute_present_ = false;        // presenting from a compute queue with a scaling shader
+    uint32_t present_family_ = 0;
+    VkQueue present_queue_handle_ = VK_NULL_HANDLE;
+    VkPipelineLayout scale_layout_ = VK_NULL_HANDLE;
+    VkPipeline scale_pipeline_ = VK_NULL_HANDLE;
+    VkSampler scale_sampler_ = VK_NULL_HANDLE;
+    std::vector<VkImageView> swapchain_views_;
+    VkCommandPool present_pool_ = VK_NULL_HANDLE;
+    VkCommandBuffer present_cmd_ = VK_NULL_HANDLE;
+    VkFence present_fence_ = VK_NULL_HANDLE;
+
+    // ------------------------------------------------------ misc (renderer.cpp)
     void load_pipeline_cache();
     void save_pipeline_cache();
-    void create_swapchain();
-    void present();
     void capture();
     void save_image(const Image& image, const std::string& path);
+    int64_t captured_frame_ = -1; // TTT2_CAPTURE: frame number and index of the last capture
+    uint32_t captured_index_ = 0;
 
     uint32_t scale_ = 1; // upscaling factor of screen-sized targets
     Context ctx_;
     GuestMemory guest_;
     UploadRing ring_;
+    // Command buffers in turn, each reused once the GPU finished it; a
+    // timeline semaphore counts finished submissions.
+    static constexpr uint32_t kSlots = 8;
+    struct Slot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        uint64_t value = 0; // timeline value of its last submission
+    };
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
+    Slot slots_[kSlots];
+    uint32_t slot_ = 0;
+    VkCommandBuffer cmd_ = VK_NULL_HANDLE; // being recorded
     bool recording_ = false;
-    VkFence fence_ = VK_NULL_HANDLE;
+    VkSemaphore timeline_ = VK_NULL_HANDLE;
+    uint64_t submitted_ = 0;               // value of the last submission
+    uint64_t chunk_value_[UploadRing::kChunks] = {}; // last submission using each upload chunk
+    uint32_t chunks_touched_ = 0;          // by the command buffer being recorded
     uint64_t events_ = 1;
 
     // Current dynamic rendering pass.
@@ -182,6 +341,14 @@ private:
 
     std::vector<std::unique_ptr<Target>> targets_;
     std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
+    // Textures and shader programs by the 64 KiB pages of guest memory they
+    // use, for the CPU-write and cache-invalidation notices (hundreds a frame).
+    std::unordered_map<uint32_t, std::vector<Texture*>> texture_pages_;
+    std::unordered_map<uint32_t, std::vector<uint64_t>> program_pages_;
+    template <typename F>
+    void for_pages(uint32_t address, uint64_t end, F f) {
+        for (uint64_t page = address >> 16; page <= (end - 1) >> 16; ++page) f(static_cast<uint32_t>(page));
+    }
     std::unordered_map<uint64_t, VkSampler> samplers_;
 
     shaderc_compiler* compiler_ = nullptr;
@@ -215,9 +382,22 @@ private:
     uint64_t frame_number_ = 0;
     uint64_t trace_frame_ = UINT64_MAX;
 
+    // TTT2_PROFILE_AT=seconds: GPU time of every operation of one frame.
+    void profile_mark(const char* what, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0);
+    void profile_report();
+    VkQueryPool profile_pool_ = VK_NULL_HANDLE;
+    bool profiling_ = false;
+    uint64_t profile_frame_ = UINT64_MAX;
+    struct ProfileMark {
+        const char* what;
+        uint32_t a, b, c;
+    };
+    std::vector<ProfileMark> profile_marks_;
+
     // Statistics, printed every ten seconds.
     uint64_t frames_ = 0, draws_ = 0, skipped_draws_ = 0, waits_ = 0;
-    double wait_seconds_ = 0;
+    double wait_seconds_ = 0, busy_seconds_ = 0;
+    VkQueryPool busy_pool_ = VK_NULL_HANDLE; // two timestamps per slot
     double window_start_ = 0;
 };
 

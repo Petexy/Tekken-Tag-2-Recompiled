@@ -137,6 +137,9 @@ private:
     int max_depth_ = 0;
     int loop_counter_ = 0;
     uint32_t texture_mask_ = 0;
+    uint32_t constant_bank_mask_ = 0; // kcache banks read
+    uint32_t constant_bank_extent_[16] = {}; // bytes of each bank read (UINT32_MAX: any)
+    uint32_t buffer_mask_ = 0;        // buffer resources fetched from
     uint32_t shadow_mask_ = 0;
     bool uses_registers_ = false;
 
@@ -223,6 +226,11 @@ std::string Translator::raw_source(const AluInstruction& in, int s, const AluGro
         }
         std::string i = format("%uu", index);
         if (src.rel) i = format("uint(%u + %s)", index, index_register(in.index_mode).c_str());
+        constant_bank_mask_ |= 1u << (lock.bank & 15);
+        // The bytes of the block the shader can read: up to this constant,
+        // or anywhere when the index is relative.
+        uint32_t& extent = constant_bank_extent_[lock.bank & 15];
+        extent = src.rel ? UINT32_MAX : std::max(extent, (index + 1) * 16);
         return format("kc(%uu, %s).%c", lock.bank, i.c_str(), c);
     }
     if (sel >= alu::kConstFile) {
@@ -661,6 +669,7 @@ void Translator::emit_buffer_fetch(const TexInstruction& t) {
     const int slot = static_cast<int>(v.buffer_id) - 128;
     const char* stage = vs_ ? "vs" : "ps";
     const std::string b = (slot >= 0 && slot < 16) ? format("dc.%s_buf[%d]", stage, slot) : "uvec4(0)";
+    if (slot >= 0 && slot < 16) buffer_mask_ |= 1u << slot;
     const std::string index = format("uint(%s.%c)", gpr(v.src_gpr, v.src_rel, 0).c_str(), kChan[v.src_sel_x & 3]);
     // Uniform blocks GX2 binds as buffers hold raw 32-bit words (32_32_32_32).
     const uint32_t data_format = v.use_const_fields ? 0x22 : v.data_format;
@@ -1423,6 +1432,9 @@ bool Translator::run(std::string& error) {
     out_.texture_mask = texture_mask_;
     out_.shadow_mask = shadow_mask_ & texture_mask_;
     out_.uses_registers = uses_registers_;
+    out_.constant_bank_mask = constant_bank_mask_;
+    std::copy(std::begin(constant_bank_extent_), std::end(constant_bank_extent_), std::begin(out_.constant_bank_extent));
+    out_.buffer_mask = buffer_mask_;
     std::string globals = format("ivec4 R[%d];\nivec4 PV = ivec4(0);\nint PSv = 0;\nbool pred = false;\n"
                                  "ivec4 AR = ivec4(0);\nivec4 ARn = ivec4(0);\nint AL = 0;\n",
                                  gpr_count_);

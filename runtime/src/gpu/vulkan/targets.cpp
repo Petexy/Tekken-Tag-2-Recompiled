@@ -86,11 +86,13 @@ Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
     t->height = height;
     t->tile_mode = tile_mode;
     t->scale = upscaled_size(pitch, height) ? scale_ : 1;
+    t->end = static_cast<uint32_t>(std::min<uint64_t>(uint64_t{address} + uint64_t{pitch} * height * std::max(1u, f.bytes), 0xFFFFFFFFu));
     t->image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, pitch * t->scale, height * t->scale, 1, 1,
                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             VK_IMAGE_VIEW_TYPE_2D);
     t->written = stamp();
+    t->written_frame = frame_number_;
     if (std::getenv("TTT2_TRACE_TARGETS")) {
         std::fprintf(stderr, "ttt2: gpu: new color target 0x%08X fmt 0x%03X %ux%u tile %u scale %u (size 0x%08X info 0x%08X)\n",
                      address, format, pitch, height, tile_mode, t->scale, size_reg, info_reg);
@@ -127,6 +129,7 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
     t->tile_mode = tile_mode;
     t->depth = true;
     t->scale = upscaled_size(pitch, height) ? scale_ : 1;
+    t->end = static_cast<uint32_t>(std::min<uint64_t>(uint64_t{address} + uint64_t{pitch} * height * 4, 0xFFFFFFFFu));
     if (std::getenv("TTT2_TRACE_TARGETS")) {
         std::fprintf(stderr, "ttt2: gpu: new depth target 0x%08X fmt 0x%03X %ux%u tile %u scale %u (size 0x%08X info 0x%08X)\n",
                      address, format, pitch, height, tile_mode, t->scale, size_reg, info_reg);
@@ -136,6 +139,7 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             VK_IMAGE_VIEW_TYPE_2D);
     t->written = stamp();
+    t->written_frame = frame_number_;
     targets_.push_back(std::move(t));
     return targets_.back().get();
 }
@@ -162,7 +166,9 @@ void Renderer::clear_color(const Registers&, const gx2::ColorBuffer& buffer, con
     VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
     barrier();
+    profile_mark("clear color", t->address, t->image.width, t->image.height);
     t->written = stamp();
+    note_target_written(t);
     if (tracing()) {
         std::fprintf(stderr, "trace: clear color 0x%08X fmt 0x%03X %ux%u (%g %g %g %g)\n", t->address, t->format,
                      t->pitch, t->height, rgba[0], rgba[1], rgba[2], rgba[3]);
@@ -184,7 +190,9 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
     VkImageSubresourceRange range{aspect, 0, 1, 0, 1};
     vkCmdClearDepthStencilImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
     barrier();
+    profile_mark("clear depth", t->address, t->image.width, t->image.height);
     t->written = stamp();
+    note_target_written(t);
     if (tracing()) {
         std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
                      t->pitch, t->height, flags, depth, stencil);
@@ -195,6 +203,7 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
 
 void Renderer::copy_target_region(const Target& src, const Image& dst, uint32_t dst_scale, uint32_t dst_layer,
                                   uint32_t width, uint32_t height) {
+    note_target_read(&src);
     end_rendering();
     barrier();
     const VkImageAspectFlags aspect = dst.aspect & src.image.aspect;
@@ -220,6 +229,7 @@ void Renderer::copy_target_region(const Target& src, const Image& dst, uint32_t 
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     barrier();
+    profile_mark("copy target", src.address, width, height);
 }
 
 namespace {
@@ -281,7 +291,9 @@ void Renderer::copy_surface(const gx2::Surface& src, uint32_t src_level, uint32_
     const bool src_depth = (src.use & gx2::surface_use::kDepthBuffer) != 0;
     Target* from = find_target(strip_swizzle(sb << 8, (si >> 8) & 0xF), src.format, src_depth);
     if (from == nullptr) {
-        // Only in guest memory: copy the elements, retiling.
+        // Only in guest memory: copy the elements, retiling. (Done by the
+        // frame itself: a replay must not write guest memory.)
+        if (replaying_) return;
         uint32_t address = 0, bytes = 0;
         if (!copy_surface_memory(src, src_level, src_slice, dst, dst_level, dst_slice, address, bytes)) {
             std::fprintf(stderr, "ttt2: gpu: GX2CopySurface fmt 0x%X -> 0x%X not supported\n", uint32_t{src.format},
@@ -301,6 +313,7 @@ void Renderer::copy_surface(const gx2::Surface& src, uint32_t src_level, uint32_
         if (to == nullptr) return;
         copy_target_region(*from, to->image, to->scale, 0, from->pitch, from->height);
         to->written = stamp();
+        note_target_written(to);
         return;
     }
     Target* to = color_target(db, ds, di);
@@ -308,6 +321,7 @@ void Renderer::copy_surface(const gx2::Surface& src, uint32_t src_level, uint32_
     copy_target_region(*from, to->image, to->scale, 0, std::max(1u, src.width >> src_level),
                        std::max(1u, src.height >> src_level));
     to->written = stamp();
+    note_target_written(to);
 }
 
 void Renderer::resolve_color(const gx2::ColorBuffer& src, const gx2::Surface& dst, uint32_t dst_level, uint32_t dst_slice) {
@@ -322,6 +336,7 @@ void Renderer::resolve_color(const gx2::ColorBuffer& src, const gx2::Surface& ds
     if (to == nullptr) return;
     copy_target_region(*from, to->image, to->scale, 0, src.surface.width, src.surface.height);
     to->written = stamp();
+    note_target_written(to);
 }
 
 void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& dst, uint32_t dst_level,
@@ -340,6 +355,7 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
     if (to == nullptr) return;
     copy_target_region(*from, to->image, to->scale, 0, src.surface.width, src.surface.height);
     to->written = stamp();
+    note_target_written(to);
 }
 
 } // namespace cafe::gpu::vk

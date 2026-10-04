@@ -210,6 +210,12 @@ const Program* Renderer::program(uint32_t address, uint32_t size, uint64_t& hash
             if (!e.ok) std::fprintf(stderr, "ttt2: gpu: shader at 0x%08X: %s\n", address, error.c_str());
         }
         it = programs_.emplace(key, std::move(e)).first;
+        if (size != 0) {
+            for_pages(address, uint64_t{address} + size, [&](uint32_t page) {
+                std::vector<uint64_t>& keys = program_pages_[page];
+                if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+            });
+        }
     }
     hash = it->second.hash;
     return it->second.ok ? &it->second.program : nullptr;
@@ -439,9 +445,21 @@ abi::Buffer Renderer::buffer_descriptor(uint32_t address, uint32_t size, uint32_
     return {static_cast<uint32_t>(device), static_cast<uint32_t>(device >> 32), std::min(size, available), stride};
 }
 
+namespace {
+// Bytes of a constant block to copy for interpolation: what the shader
+// reads; a block it indexes freely only whole and up to 256 KiB (0: read
+// it in place).
+uint32_t read_extent(uint32_t size, uint32_t extent) {
+    if (extent != UINT32_MAX) return std::min(size, extent);
+    return size <= (256u << 10) ? size : 0;
+}
+} // namespace
+
 void Renderer::draw(const Registers& regs, const Draw& d) {
-    ++draws_;
+    if (!replaying_) ++draws_;
     const auto r = [&](uint32_t address) { return regs[address]; };
+    // Interpolation: every draw of a frame and of its replays, in order.
+    const uint32_t draw_index = frames_per_frame_ > 1 ? begin_draw_record(regs, d) : 0;
     const uint32_t instances = std::max<uint32_t>(d.num_instances, 1);
 
     // Primitive type: Vulkan topology, or a conversion through indices.
@@ -553,23 +571,41 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
 
     // Per-draw constants.
     abi::DrawConstants dc{};
+    const bool record = frames_per_frame_ > 1 && !replaying_;
+    ConstantSources sources;
     for (uint32_t i = 0; i < 16; ++i) {
         if (const uint32_t a = r(reg::SQ_ALU_CONST_CACHE_VS_0 + i * 4)) {
-            dc.vs_cb[i] = buffer_descriptor(a << 8, r(reg::SQ_ALU_CONST_BUFFER_SIZE_VS_0 + i * 4) << 8, 16);
+            const uint32_t size = r(reg::SQ_ALU_CONST_BUFFER_SIZE_VS_0 + i * 4) << 8;
+            dc.vs_cb[i] = buffer_descriptor(a << 8, size, 16);
+            if (record && (vs->info.constant_bank_mask >> i) & 1) {
+                sources.add({0, 0, static_cast<uint8_t>(i), a << 8, read_extent(size, vs->info.constant_bank_extent[i]), 16});
+            }
         }
         if (const uint32_t a = r(reg::SQ_ALU_CONST_CACHE_PS_0 + i * 4)) {
-            dc.ps_cb[i] = buffer_descriptor(a << 8, r(reg::SQ_ALU_CONST_BUFFER_SIZE_PS_0 + i * 4) << 8, 16);
+            const uint32_t size = r(reg::SQ_ALU_CONST_BUFFER_SIZE_PS_0 + i * 4) << 8;
+            dc.ps_cb[i] = buffer_descriptor(a << 8, size, 16);
+            if (record && (ps->info.constant_bank_mask >> i) & 1) {
+                sources.add({1, 0, static_cast<uint8_t>(i), a << 8, read_extent(size, ps->info.constant_bank_extent[i]), 16});
+            }
         }
-        const auto buffer = [&](uint32_t slot) {
+        const auto buffer = [&](uint32_t slot, int stage, uint32_t mask) {
             const uint32_t base = kResourceBase + slot * resource::kWords * 4;
             if ((r(base + 24) >> 30) != (resource::kTypeValidBuffer >> 30)) return abi::Buffer{};
-            return buffer_descriptor(r(base), r(base + 4) + 1, (r(base + 8) >> 8) & 0x7FF);
+            const uint32_t stride = (r(base + 8) >> 8) & 0x7FF;
+            if (record && stage >= 0 && (mask >> i) & 1) {
+                sources.add({static_cast<uint8_t>(stage), 1, static_cast<uint8_t>(i), r(base),
+                             read_extent(r(base + 4) + 1, UINT32_MAX), stride});
+            }
+            return buffer_descriptor(r(base), r(base + 4) + 1, stride);
         };
-        dc.vs_buf[i] = buffer(resource::kVsBuffer + i);
-        dc.ps_buf[i] = buffer(resource::kPsBuffer + i);
-        dc.vb[i] = buffer(resource::kVsAttrib + i);
+        dc.vs_buf[i] = buffer(resource::kVsBuffer + i, 0, vs->info.buffer_mask);
+        dc.ps_buf[i] = buffer(resource::kPsBuffer + i, 1, ps->info.buffer_mask);
+        dc.vb[i] = buffer(resource::kVsAttrib + i, -1, 0);
     }
-    if (stream_out) {
+    // Stream-out writes guest memory, which a replay must not touch (the
+    // draws that read it use what the frame wrote): a replayed draw keeps
+    // its rasterised output, its stream-out buffers are empty.
+    if (stream_out && !replaying_) {
         for (uint32_t i = 0; i < 4; ++i) {
             const uint32_t base = r(reg::VGT_STRMOUT_BUFFER_BASE_0 + i * 16) << 8;
             const uint32_t offset = r(reg::VGT_STRMOUT_BUFFER_OFFSET_0 + i * 16) * 4;
@@ -601,6 +637,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
         if (vs_textures[slot].scaled) dc.vs_scaled_textures |= 1u << slot;
         if (ps_textures[slot].scaled) dc.ps_scaled_textures |= 1u << slot;
     }
+    if (record) record_constants(draw_index, sources, dc);
+    if (replaying_) replace_constants(draw_index, dc);
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(ctx_.properties.limits.minUniformBufferOffsetAlignment, 16);
     VkDeviceSize dc_offset = 0;
     std::memcpy(upload(sizeof(dc), ubo_align, dc_offset), &dc, sizeof(dc));
@@ -626,12 +664,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
         const uint8_t* source = nullptr;
         if (d.source != Draw::kAuto) {
             const uint32_t bytes = d.count * (wide ? 4 : 2);
-            if (!guest_memory_committed(d.index_address, bytes)) {
-                report_once("draw skipped: index buffer outside guest memory, at", d.index_address);
-                ++skipped_draws_;
-                return;
+            if (d.host_indices) {
+                source = d.host_indices;
+            } else {
+                if (!guest_memory_committed(d.index_address, bytes)) {
+                    report_once("draw skipped: index buffer outside guest memory, at", d.index_address);
+                    ++skipped_draws_;
+                    return;
+                }
+                source = guest_pointer(d.index_address);
             }
-            source = guest_pointer(d.index_address);
         }
         const auto index = [&](uint32_t i) -> uint32_t {
             if (source == nullptr) return i;
@@ -660,6 +702,28 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
         uint32_t* out = reinterpret_cast<uint32_t*>(upload(VkDeviceSize{index_count} * 4, 4, index_offset));
         switch (convert) {
         case Convert::kNone:
+            if (d.source == Draw::kIndexBuffer && (wide ? swap == 2 || swap == 0 : true)) {
+                // The common case, in loops the compiler vectorises.
+                const uint32_t marker = restart ? restart_index : 0xFFFFFFFFu;
+                if (wide) {
+                    const uint32_t* in = reinterpret_cast<const uint32_t*>(source);
+                    for (uint32_t i = 0; i < index_count; ++i) {
+                        uint32_t v;
+                        std::memcpy(&v, in + i, 4);
+                        v = swap == 2 ? __builtin_bswap32(v) : v;
+                        out[i] = v == marker ? 0xFFFFFFFFu : v;
+                    }
+                } else {
+                    const uint16_t* in = reinterpret_cast<const uint16_t*>(source);
+                    for (uint32_t i = 0; i < index_count; ++i) {
+                        uint16_t h;
+                        std::memcpy(&h, in + i, 2);
+                        const uint32_t v = swap != 0 ? static_cast<uint16_t>((h >> 8) | (h << 8)) : h;
+                        out[i] = v == marker ? 0xFFFFFFFFu : v;
+                    }
+                }
+                break;
+            }
             for (uint32_t i = 0; i < index_count; ++i) out[i] = index(i);
             break;
         case Convert::kQuads:
@@ -905,12 +969,23 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     } else {
         vkCmdDraw(c, d.count, instances, 0, 0);
     }
+    if (profiling_) {
+        profile_mark("draw", colors[0] ? colors[0]->address : depth ? depth->address : 0,
+                     (colors[0] ? colors[0]->pitch * colors[0]->scale : 0) << 16 | (colors[0] ? colors[0]->height * colors[0]->scale : 0),
+                     d.count * std::max(instances, 1u));
+    }
 
     const uint64_t now = stamp();
     for (uint32_t i = 0; i < color_count; ++i) {
-        if (colors[i]) const_cast<Target*>(colors[i])->written = now;
+        if (colors[i]) {
+            const_cast<Target*>(colors[i])->written = now;
+            note_target_written(colors[i]);
+        }
     }
-    if (depth && ((depth_control >> 2) & 1 || stencil)) const_cast<Target*>(depth)->written = now;
+    if (depth && ((depth_control >> 2) & 1 || stencil)) {
+        const_cast<Target*>(depth)->written = now;
+        note_target_written(depth);
+    }
 }
 
 } // namespace cafe::gpu::vk

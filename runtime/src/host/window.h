@@ -27,5 +27,7 @@ VkSurfaceKHR create_vulkan_surface(VkInstance instance);
 void drawable_size(uint32_t& width, uint32_t& height);
 // The desktop resolution of the primary display, in pixels.
 void display_size(uint32_t& width, uint32_t& height);
+// The primary display's refresh rate, in Hz.
+float display_refresh_rate();
 
 } // namespace cafe::host

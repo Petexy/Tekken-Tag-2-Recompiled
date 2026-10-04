@@ -36,6 +36,12 @@ struct Context {
     VkDevice device = VK_NULL_HANDLE;
     uint32_t queue_family = 0;
     VkQueue queue = VK_NULL_HANDLE;
+    // A queue of a compute-only family (AMD's asynchronous compute rings):
+    // presentation runs there so it never waits behind rendering.
+    // UINT32_MAX / null if the GPU has none.
+    uint32_t present_family = UINT32_MAX;
+    VkQueue present_queue = VK_NULL_HANDLE;
+    bool storage_without_format = false;
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory{};
     bool custom_border_color = false;
@@ -79,21 +85,37 @@ private:
 };
 
 // Host-visible memory the renderer writes per draw and per transfer
-// (constants, indices, staging). Reset once the GPU has finished with it.
+// (constants, indices, staging), in chunks used in turn: the renderer moves
+// to the next chunk once the GPU has finished every submission that used it.
 class UploadRing {
 public:
+    static constexpr uint32_t kChunks = 8;
     void init(Context& context, VkDeviceSize size);
-    // Null when full: the caller submits, waits and resets.
+    // Null when the current chunk is full.
     uint8_t* allocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset);
-    void reset() { used_ = 0; }
+    uint32_t chunk() const { return chunk_; }
+    // Makes `count` chunks from `first` the current position, as one
+    // allocation of `size` bytes from the start of `first`.
+    uint8_t* take_span(uint32_t first, uint32_t count, VkDeviceSize size, VkDeviceSize& offset) {
+        chunk_ = first + count - 1;
+        used_ = size - (count - 1) * chunk_size();
+        offset = first * chunk_size();
+        return buffer_.mapped + offset;
+    }
+    uint32_t next_chunk() const { return (chunk_ + 1) % kChunks; }
+    void advance() {
+        chunk_ = next_chunk();
+        used_ = 0;
+    }
+    VkDeviceSize chunk_size() const { return buffer_.size / kChunks; }
     VkBuffer buffer() const { return buffer_.buffer; }
     VkDeviceAddress address() const { return buffer_.address; }
-    VkDeviceSize capacity() const { return buffer_.size; }
     uint8_t* mapped() const { return buffer_.mapped; }
 
 private:
     Buffer buffer_;
-    VkDeviceSize used_ = 0;
+    uint32_t chunk_ = 0;
+    VkDeviceSize used_ = 0; // in the current chunk
 };
 
 } // namespace cafe::gpu::vk

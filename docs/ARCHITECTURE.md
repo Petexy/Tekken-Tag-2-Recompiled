@@ -201,11 +201,13 @@ attachment formats and blend state.
 
 - Guest memory (MEM2, MEM1) is imported with VK_EXT_external_memory_host,
   so the GPU reads the title's buffers in place.
-- The renderer is synchronous with the command processor: work is
-  submitted and waited for before a submission's timestamp retires, an
-  end-of-pipe event is written or a frame completes. Everything the guest
-  can observe follows the GPU work it depends on, and buffers it reuses
-  after a wait are no longer read.
+- Submission is asynchronous: command buffers (8 in turn) and upload
+  memory (8 chunks of a 256 MiB host buffer) are tracked on a timeline
+  semaphore and reused once the GPU has finished with them. The command
+  processor never waits; a retirement thread performs what the guest can
+  observe (retired timestamps, end-of-pipe memory writes, finished
+  frames) in command order once the GPU work before it has finished, so
+  buffers the guest reuses after a wait are no longer read.
 - Render targets and depth buffers are GPU images keyed by address,
   format and size (the title aliases memory between differently sized
   targets). A texture is an image per resource: copied from a render
@@ -234,6 +236,36 @@ attachment formats and blend state.
   shaders that also write colour, which Vulkan discards when no colour
   attachment is bound; trimming those outputs would multiply shader
   variants.
+- Frame interpolation (`gpu/vulkan/interpolate.cpp`, default on displays
+  of 100 Hz or more, `TTT2_FPS=60/120/180/240`): the title's logic,
+  physics and hitboxes stay at 59.94 steps a second; between two of its
+  frames the renderer shows K-1 more. The command processor logs each
+  frame (register writes and operations with their arguments, nothing the
+  guest can observe) and replays it after the swap; every draw's constant
+  data (uniform blocks, buffer resources: camera, transforms, the
+  characters' bone matrices, fetched by the vertex shaders) is copied into
+  a GPU-visible record that the real draw reads too, and a replay blends
+  it with the previous frame's matching draw (same shaders, targets,
+  vertex count and first texture, in order), value by value where both
+  are ordinary floats. Draws whose data mostly jumps (a different object,
+  a cut) and frames where fewer than 80% of draws match are shown as they
+  are. Replays skip anything that writes guest memory (stream-out writes,
+  CPU-side surface copies); render targets a frame reads before writing
+  them start replays from their start-of-frame content, and the next
+  frame sees the real frame's. With unblended replays
+  (`TTT2_INTERP_TEST=1`) every extra frame equals its real frame pixel for
+  pixel (checked through menus, character select and fights). Particles
+  whose geometry the CPU rebuilds each frame and the HUD move at 60 Hz.
+- Presentation (`gpu/vulkan/present.cpp`) runs on its own thread and on a
+  compute queue (AMD's asynchronous compute, `TTT2_PRESENT_BLIT=1` for
+  the rendering queue): a present there waits only for its own frame, not
+  for rendering queued after it. A compute shader scales the frame,
+  letterboxed, into the swapchain. Frames get display slots one title
+  frame apart (re-anchored when the title falls behind) at a lead after
+  their swap, the 98th percentile of how long frames take to finish on
+  the GPU; each slot shows the extra frames first and the real one last.
+  With interpolation the real image is shown half a frame later than
+  without.
 - Compiled SPIR-V and the Vulkan pipeline cache persist in
   `~/.cache/ttt2` (`$XDG_CACHE_HOME/ttt2`).
 
@@ -278,6 +310,10 @@ per frame every ten seconds. Renderer debugging:
 | `TTT2_TRACE_TARGETS=1`, `TTT2_WATCH=<hex address>` | render target creation; writes and loads touching an address |
 | `TTT2_CHECK_TILING=1` | compare fast detiling with addrlib per element |
 | `TTT2_SCALE=1..4` | render scale of screen-sized targets (default from the display) |
+| `TTT2_FPS=60/120/180/240` | frames shown per second (default 120 on displays of 100 Hz and more) |
+| `TTT2_INTERP_TEST=1` | replays without blending: extra frames must equal real ones |
+| `TTT2_TRACE_INTERP=1`, `TTT2_TRACE_PACING=1` | draw matching, carried targets; frame readiness |
+| `TTT2_PROFILE_AT=<s>` | GPU time of every operation of one frame |
 | `TTT2_VK_VALIDATION=1` | Khronos validation layer, if installed (synchronization checks: `khronos_validation.validate_sync = true` in a file named by `VK_LAYER_SETTINGS_PATH`) |
 | `TTT2_AUDIO_DUMP=<file.wav>` | everything played, as 48 kHz stereo WAV (also without a device) |
 | `TTT2_TRACE_AX=1` | voice set-up, device mixes, output level |

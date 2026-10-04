@@ -49,6 +49,14 @@ runtime. nWiiURecomp is kept only as a reference and a test oracle.
   `cafe-recomp` turns the reachable 79,564 functions (6.03M instructions)
   into 257 C++ files in ~2 s; clang builds them with the runtime into a
   132 MB x86-64 `ttt2` in ~4 minutes.
+- **Up to 120 frames per second at up to 4x resolution**: on a display
+  of 100 Hz or more the port shows an extra frame between each two the
+  game renders, drawn from the same frame with camera, objects and
+  character skeletons blended halfway; the game's 60 Hz logic, physics
+  and hitboxes are untouched. Screen-sized buffers render at a multiple
+  of 720p (2x = 2560x1440 by default on a 1440p display). On an RX 9060
+  XT fights run at a steady 59.9 game frames and ~120 shown frames per
+  second at 2x, with frames 8.3 ms apart.
 - The renderer (`runtime/src/gpu/vulkan/`) translates the game's Latte
   shaders to GLSL/SPIR-V (`runtime/src/latte/`), reads vertex and uniform
   data from guest memory in place, detiles textures with AMD's address

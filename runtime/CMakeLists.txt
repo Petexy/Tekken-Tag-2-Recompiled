@@ -38,6 +38,8 @@ add_library(cafe_runtime OBJECT
     src/gpu/vulkan/context.cpp
     src/gpu/vulkan/draw.cpp
     src/gpu/vulkan/formats.cpp
+    src/gpu/vulkan/interpolate.cpp
+    src/gpu/vulkan/present.cpp
     src/gpu/vulkan/png.cpp
     src/gpu/vulkan/renderer.cpp
     src/gpu/vulkan/targets.cpp

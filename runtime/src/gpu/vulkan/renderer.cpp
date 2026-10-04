@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 
 namespace cafe::gpu {
 
@@ -36,20 +37,29 @@ Renderer::Renderer() {
     init_formats(ctx_.physical);
     guest_.init(ctx_);
     ring_.init(ctx_, kRingSize);
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VK_CHECK(vkCreateSemaphore(ctx_.device, &sci, nullptr, &acquired_));
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.queueFamilyIndex = ctx_.queue_family;
-    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VK_CHECK(vkCreateCommandPool(ctx_.device, &pci, nullptr, &pool_));
-    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = pool_;
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(ctx_.device, &cai, &cmd_));
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VK_CHECK(vkCreateFence(ctx_.device, &fci, nullptr, &fence_));
-    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    VK_CHECK(vkCreateSemaphore(ctx_.device, &sci, nullptr, &acquired_));
+    for (Slot& slot : slots_) {
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = pool_;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VK_CHECK(vkAllocateCommandBuffers(ctx_.device, &cai, &slot.cmd));
+    }
+    VkSemaphoreTypeCreateInfo tci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo tsci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    tsci.pNext = &tci;
+    VK_CHECK(vkCreateSemaphore(ctx_.device, &tsci, nullptr, &timeline_));
+    VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qci.queryCount = 2 * kSlots;
+    VK_CHECK(vkCreateQueryPool(ctx_.device, &qci, nullptr, &busy_pool_));
 
     if (const char* f = std::getenv("TTT2_TRACE_FRAME")) trace_frame_ = std::strtoull(f, nullptr, 10);
     // Render scale: TTT2_SCALE=1-4, else enough to cover the display
@@ -65,7 +75,8 @@ Renderer::Renderer() {
     compiler_ = shaderc_compiler_initialize();
     load_pipeline_cache();
     surface_ = host::create_vulkan_surface(ctx_.instance);
-    create_swapchain();
+    init_interpolation();
+    start_presenter();
     window_start_ = now_seconds();
 }
 
@@ -73,34 +84,85 @@ Renderer::Renderer() {
 
 VkCommandBuffer Renderer::cmd() {
     if (!recording_) {
+        Slot& slot = slots_[slot_];
+        if (slot.value != 0) {
+            wait_value(slot.value);
+            // Its GPU execution time, for the statistics.
+            uint64_t ts[2];
+            if (vkGetQueryPoolResults(ctx_.device, busy_pool_, 2 * slot_, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) ==
+                    VK_SUCCESS &&
+                ts[1] >= ts[0]) {
+                busy_seconds_ += (ts[1] - ts[0]) * ctx_.properties.limits.timestampPeriod * 1e-9;
+            }
+        }
+        cmd_ = slot.cmd;
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
         recording_ = true;
+        vkCmdResetQueryPool(cmd_, busy_pool_, 2 * slot_, 2);
+        vkCmdWriteTimestamp2(cmd_, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, busy_pool_, 2 * slot_);
     }
     return cmd_;
 }
 
-void Renderer::submit(bool wait) {
-    if (!recording_) return;
-    end_rendering();
-    VK_CHECK(vkEndCommandBuffer(cmd_));
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd_;
-    VK_CHECK(vkQueueSubmit(ctx_.queue, 1, &si, fence_));
-    recording_ = false;
-    bound_pipeline_ = nullptr;
-    if (wait) {
-        const double begin = now_seconds();
-        const VkResult r = vkWaitForFences(ctx_.device, 1, &fence_, VK_TRUE, 10'000'000'000ull);
-        wait_seconds_ += now_seconds() - begin;
-        ++waits_;
-        if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
-        VK_CHECK(vkResetFences(ctx_.device, 1, &fence_));
-        VK_CHECK(vkResetCommandPool(ctx_.device, pool_, 0));
-        ring_.reset();
+void Renderer::wait_value(uint64_t value) {
+    uint64_t done = 0;
+    VK_CHECK(vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done));
+    if (done >= value) return;
+    const double begin = now_seconds();
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &timeline_;
+    wi.pValues = &value;
+    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull);
+    if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
+    wait_seconds_ += now_seconds() - begin;
+    ++waits_;
+}
+
+uint64_t Renderer::submit(bool wait) {
+    if (recording_) {
+        end_rendering();
+        vkCmdWriteTimestamp2(cmd_, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, busy_pool_, 2 * slot_ + 1);
+        VK_CHECK(vkEndCommandBuffer(cmd_));
+        const uint64_t value = ++submitted_;
+        VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        ti.signalSemaphoreValueCount = 1;
+        ti.pSignalSemaphoreValues = &value;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.pNext = &ti;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd_;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &timeline_;
+        {
+            std::lock_guard lock(queue_mutex_);
+            VK_CHECK(vkQueueSubmit(ctx_.queue, 1, &si, VK_NULL_HANDLE));
+        }
+        slots_[slot_].value = value;
+        slot_ = (slot_ + 1) % kSlots;
+        for (uint32_t c = 0; c < UploadRing::kChunks; ++c) {
+            if (chunks_touched_ & (1u << c)) chunk_value_[c] = value;
+        }
+        chunks_touched_ = 0;
+        recording_ = false;
+        bound_pipeline_ = nullptr;
     }
+    if (wait) wait_value(submitted_);
+    return submitted_;
+}
+
+uint64_t Renderer::flush() { return submit(false); }
+
+// From the command processor's retirement thread.
+void Renderer::wait_for(uint64_t value) {
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &timeline_;
+    wi.pValues = &value;
+    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull);
+    if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
 }
 
 void Renderer::sync() { submit(true); }
@@ -118,10 +180,38 @@ void Renderer::barrier() {
 }
 
 uint8_t* Renderer::upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset) {
-    if (uint8_t* p = ring_.allocate(size, alignment, offset)) return p;
-    submit(true);
-    if (uint8_t* p = ring_.allocate(size, alignment, offset)) return p;
-    fatal("Vulkan: an upload of %llu bytes does not fit the upload ring", static_cast<unsigned long long>(size));
+    if (uint8_t* p = ring_.allocate(size, alignment, offset)) {
+        chunks_touched_ |= 1u << ring_.chunk();
+        return p;
+    }
+    // Bigger than a chunk (a capture or texture at a high render scale): a
+    // run of consecutive chunks, once the GPU finished with all of them.
+    if (size > ring_.chunk_size()) {
+        const uint32_t count = static_cast<uint32_t>((size + ring_.chunk_size() - 1) / ring_.chunk_size());
+        if (count > UploadRing::kChunks) {
+            fatal("Vulkan: an upload of %llu bytes does not fit the upload ring", static_cast<unsigned long long>(size));
+        }
+        uint32_t first = ring_.next_chunk();
+        if (first + count > UploadRing::kChunks) first = 0;
+        bool touched = false;
+        for (uint32_t c = first; c < first + count; ++c) touched |= (chunks_touched_ >> c) & 1;
+        if (touched) submit(false);
+        for (uint32_t c = first; c < first + count; ++c) {
+            wait_value(chunk_value_[c]);
+            chunks_touched_ |= 1u << c;
+        }
+        return ring_.take_span(first, count, size, offset);
+    }
+    // The next chunk, once the GPU finished with it (it rarely has not).
+    const uint32_t next = ring_.next_chunk();
+    if (chunks_touched_ & (1u << next)) submit(false); // the commands being recorded use it
+    wait_value(chunk_value_[next]);
+    ring_.advance();
+    if (uint8_t* p = ring_.allocate(size, alignment, offset)) {
+        chunks_touched_ |= 1u << ring_.chunk();
+        return p;
+    }
+    fatal("Vulkan: an upload of %llu bytes does not fit an upload chunk", static_cast<unsigned long long>(size));
 }
 
 void Renderer::end_rendering() {
@@ -133,7 +223,8 @@ void Renderer::end_rendering() {
 }
 
 Image Renderer::create_image(VkFormat format, VkImageAspectFlags aspect, uint32_t width, uint32_t height,
-                             uint32_t layers, uint32_t levels, VkImageUsageFlags usage, VkImageViewType view_type) {
+                             uint32_t layers, uint32_t levels, VkImageUsageFlags usage, VkImageViewType view_type,
+                             bool shared) {
     Image img;
     img.format = format;
     img.aspect = aspect;
@@ -158,6 +249,12 @@ Image Renderer::create_image(VkFormat format, VkImageAspectFlags aspect, uint32_
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = usage;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    const uint32_t families[2] = {ctx_.queue_family, ctx_.present_family};
+    if (shared && ctx_.present_family != UINT32_MAX && ctx_.present_family != ctx_.queue_family) {
+        ici.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        ici.queueFamilyIndexCount = 2;
+        ici.pQueueFamilyIndices = families;
+    }
     VK_CHECK(vkCreateImage(ctx_.device, &ici, nullptr, &img.image));
     img.memory = ctx_.allocate_image_memory(img.image);
 
@@ -222,6 +319,7 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
     vkCmdCopyImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, scan.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     barrier();
     scan_valid_[index] = true;
+    profile_mark("copy to scan buffer", t->address, width, height);
     if (tracing()) {
         std::fprintf(stderr, "trace: copy to scan %u from 0x%08X fmt 0x%03X %ux%u\n", scan_target, t->address, t->format,
                      width, height);
@@ -229,176 +327,6 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
 }
 
 // --------------------------------------------------------- presentation
-
-void Renderer::create_swapchain() {
-    VkSurfaceCapabilitiesKHR caps;
-    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx_.physical, surface_, &caps));
-    uint32_t count = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(ctx_.physical, surface_, &count, nullptr);
-    std::vector<VkSurfaceFormatKHR> formats(count);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(ctx_.physical, surface_, &count, formats.data());
-    // The TV image holds display-ready values: present them unconverted.
-    const bool srgb = scan_[0].format == VK_FORMAT_R8G8B8A8_SRGB || scan_[0].format == VK_FORMAT_B8G8R8A8_SRGB;
-    VkSurfaceFormatKHR chosen = formats[0];
-    for (const auto& f : formats) {
-        const bool f_srgb = f.format == VK_FORMAT_B8G8R8A8_SRGB || f.format == VK_FORMAT_R8G8B8A8_SRGB;
-        const bool f_unorm = f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM;
-        if ((srgb && f_srgb) || (!srgb && f_unorm)) {
-            chosen = f;
-            break;
-        }
-    }
-    uint32_t mode_count = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(ctx_.physical, surface_, &mode_count, nullptr);
-    std::vector<VkPresentModeKHR> modes(mode_count);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(ctx_.physical, surface_, &mode_count, modes.data());
-    // The display clock paces the title; presentation must not block it.
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    for (VkPresentModeKHR m : modes) {
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
-    }
-    if (mode == VK_PRESENT_MODE_FIFO_KHR) {
-        for (VkPresentModeKHR m : modes) {
-            if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
-        }
-    }
-    uint32_t width, height;
-    host::drawable_size(width, height);
-    if (caps.currentExtent.width != UINT32_MAX) {
-        width = caps.currentExtent.width;
-        height = caps.currentExtent.height;
-    }
-    width = std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width);
-    height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
-
-    VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
-    sci.surface = surface_;
-    sci.minImageCount = std::max(caps.minImageCount, 3u);
-    if (caps.maxImageCount) sci.minImageCount = std::min(sci.minImageCount, caps.maxImageCount);
-    sci.imageFormat = chosen.format;
-    sci.imageColorSpace = chosen.colorSpace;
-    sci.imageExtent = {width, height};
-    sci.imageArrayLayers = 1;
-    sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = caps.currentTransform;
-    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    sci.presentMode = mode;
-    sci.clipped = VK_TRUE;
-    sci.oldSwapchain = swapchain_;
-    VkSwapchainKHR swapchain;
-    VK_CHECK(vkCreateSwapchainKHR(ctx_.device, &sci, nullptr, &swapchain));
-    if (swapchain_) {
-        vkDeviceWaitIdle(ctx_.device);
-        vkDestroySwapchainKHR(ctx_.device, swapchain_, nullptr);
-    }
-    swapchain_ = swapchain;
-    swapchain_format_ = chosen.format;
-    swapchain_extent_ = sci.imageExtent;
-    vkGetSwapchainImagesKHR(ctx_.device, swapchain_, &count, nullptr);
-    swapchain_images_.resize(count);
-    vkGetSwapchainImagesKHR(ctx_.device, swapchain_, &count, swapchain_images_.data());
-    VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    while (rendered_.size() < count) {
-        VkSemaphore s;
-        VK_CHECK(vkCreateSemaphore(ctx_.device, &semaphore, nullptr, &s));
-        rendered_.push_back(s);
-    }
-}
-
-void Renderer::present() {
-    if (!scan_valid_[0]) return;
-    uint32_t width, height;
-    host::drawable_size(width, height);
-    const bool srgb_scan = scan_[0].format == VK_FORMAT_R8G8B8A8_SRGB;
-    const bool srgb_chain = swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB || swapchain_format_ == VK_FORMAT_R8G8B8A8_SRGB;
-    if (width != swapchain_extent_.width || height != swapchain_extent_.height || srgb_scan != srgb_chain) {
-        submit(true);
-        create_swapchain();
-    }
-    uint32_t index = 0;
-    VkResult r = vkAcquireNextImageKHR(ctx_.device, swapchain_, UINT64_MAX, acquired_, VK_NULL_HANDLE, &index);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
-        submit(true);
-        create_swapchain();
-        return;
-    }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) check_failed("vkAcquireNextImageKHR", r, __FILE__, __LINE__);
-    VkImage image = swapchain_images_[index];
-    VkCommandBuffer c = cmd();
-    end_rendering();
-    const auto transition = [&](VkImageLayout from, VkImageLayout to) {
-        VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-        ib.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        ib.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-        ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        ib.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-        ib.oldLayout = from;
-        ib.newLayout = to;
-        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        ib.image = image;
-        ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        di.imageMemoryBarrierCount = 1;
-        di.pImageMemoryBarriers = &ib;
-        vkCmdPipelineBarrier2(c, &di);
-    };
-    transition(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkClearColorValue black{};
-    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(c, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-    transition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    // Letterboxed to the TV image's aspect ratio.
-    const Image& scan = scan_[0];
-    const double scale = std::min(double(swapchain_extent_.width) / scan.width, double(swapchain_extent_.height) / scan.height);
-    const int32_t w = static_cast<int32_t>(scan.width * scale), h = static_cast<int32_t>(scan.height * scale);
-    const int32_t x = (static_cast<int32_t>(swapchain_extent_.width) - w) / 2;
-    const int32_t y = (static_cast<int32_t>(swapchain_extent_.height) - h) / 2;
-    VkImageBlit blit{};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {static_cast<int32_t>(scan.width), static_cast<int32_t>(scan.height), 1};
-    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.dstOffsets[0] = {x, y, 0};
-    blit.dstOffsets[1] = {x + w, y + h, 1};
-    vkCmdBlitImage(c, scan.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                   VK_FILTER_LINEAR);
-    transition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-
-    VK_CHECK(vkEndCommandBuffer(cmd_));
-    recording_ = false;
-    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &acquired_;
-    si.pWaitDstStageMask = &wait_stage;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd_;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &rendered_[index];
-    VK_CHECK(vkQueueSubmit(ctx_.queue, 1, &si, fence_));
-    const double begin = now_seconds();
-    VK_CHECK(vkWaitForFences(ctx_.device, 1, &fence_, VK_TRUE, UINT64_MAX));
-    wait_seconds_ += now_seconds() - begin;
-    ++waits_;
-    VK_CHECK(vkResetFences(ctx_.device, 1, &fence_));
-    VK_CHECK(vkResetCommandPool(ctx_.device, pool_, 0));
-    ring_.reset();
-    bound_pipeline_ = nullptr;
-
-    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &rendered_[index];
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &swapchain_;
-    pi.pImageIndices = &index;
-    r = vkQueuePresentKHR(ctx_.queue, &pi);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
-        vkQueueWaitIdle(ctx_.queue);
-        create_swapchain();
-    } else if (r != VK_SUCCESS) {
-        check_failed("vkQueuePresentKHR", r, __FILE__, __LINE__);
-    }
-}
 
 // Saves an 8-bit RGBA/BGRA image as a PNG (debugging); waits for the GPU.
 void Renderer::save_image(const Image& img, const std::string& path) {
@@ -417,17 +345,7 @@ void Renderer::save_image(const Image& img, const std::string& path) {
     region.imageSubresource = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {img.width, img.height, 1};
     vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_GENERAL, ring_.buffer(), 1, &region);
-    // Wait without resetting the ring, then read.
-    VK_CHECK(vkEndCommandBuffer(cmd_));
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd_;
-    VK_CHECK(vkQueueSubmit(ctx_.queue, 1, &si, fence_));
-    VK_CHECK(vkWaitForFences(ctx_.device, 1, &fence_, VK_TRUE, UINT64_MAX));
-    VK_CHECK(vkResetFences(ctx_.device, 1, &fence_));
-    VK_CHECK(vkResetCommandPool(ctx_.device, pool_, 0));
-    recording_ = false;
-    bound_pipeline_ = nullptr;
+    submit(true);
     std::vector<uint8_t> pixels(data, data + bytes);
     for (size_t i = 0; i < pixels.size(); i += 4) {
         if (depth) {
@@ -441,7 +359,6 @@ void Renderer::save_image(const Image& img, const std::string& path) {
         pixels[i + 3] = 255;
     }
     write_png(path, pixels.data(), img.width, img.height);
-    ring_.reset();
 }
 
 // TTT2_CAPTURE=<directory>: every TTT2_CAPTURE_INTERVAL seconds (default
@@ -475,13 +392,83 @@ void Renderer::capture() {
         std::snprintf(name, sizeof(name), "/%s_%04u.png", s == 0 ? "tv" : "drc", index);
         save_image(scan_[s], std::string(dir) + name);
     }
+    captured_frame_ = static_cast<int64_t>(frame_number_);
+    captured_index_ = index;
     ++index;
+}
+
+// ------------------------------------------------------------ profiling
+
+void Renderer::profile_mark(const char* what, uint32_t a, uint32_t b, uint32_t c) {
+    if (!profiling_ || profile_marks_.size() >= 8191) return;
+    vkCmdWriteTimestamp2(cmd(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, profile_pool_,
+                         static_cast<uint32_t>(profile_marks_.size()));
+    profile_marks_.push_back({what, a, b, c});
+}
+
+void Renderer::profile_report() {
+    const uint32_t n = static_cast<uint32_t>(profile_marks_.size());
+    std::vector<uint64_t> ts(n);
+    if (n < 2 || vkGetQueryPoolResults(ctx_.device, profile_pool_, 0, n, n * 8, ts.data(), 8,
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) {
+        return;
+    }
+    const double ns = ctx_.properties.limits.timestampPeriod;
+    struct Item {
+        double ms;
+        uint32_t index;
+    };
+    std::vector<Item> items;
+    std::map<std::string, std::pair<double, uint32_t>> by_kind;
+    double total = 0;
+    for (uint32_t i = 1; i < n; ++i) {
+        // Marks in different submissions are not comparable when the GPU idled between them.
+        const double ms = ts[i] >= ts[i - 1] ? (ts[i] - ts[i - 1]) * ns / 1e6 : 0.0;
+        items.push_back({ms, i});
+        auto& k = by_kind[profile_marks_[i].what];
+        k.first += ms;
+        k.second += 1;
+        total += ms;
+    }
+    std::fprintf(stderr, "profile: frame %llu, %u operations, %.2f ms of GPU time\n",
+                 static_cast<unsigned long long>(frame_number_), n - 1, total);
+    for (const auto& [what, v] : by_kind) {
+        std::fprintf(stderr, "profile:   %-28s %5u x  %7.3f ms\n", what.c_str(), v.second, v.first);
+    }
+    std::sort(items.begin(), items.end(), [](const Item& x, const Item& y) { return x.ms > y.ms; });
+    for (size_t i = 0; i < std::min<size_t>(items.size(), 40); ++i) {
+        const ProfileMark& m = profile_marks_[items[i].index];
+        std::fprintf(stderr, "profile:   #%-4u %7.3f ms  %s 0x%08X 0x%08X 0x%08X\n", items[i].index, items[i].ms, m.what,
+                     m.a, m.b, m.c);
+    }
 }
 
 void Renderer::swap() {
     capture();
-    present();
-    submit(true);
+    show_frame();
+    if (profiling_) {
+        submit(true);
+        profile_report();
+        profiling_ = false;
+    }
+    static const double profile_at = [] {
+        const char* v = std::getenv("TTT2_PROFILE_AT");
+        return v ? std::atof(v) : -1.0;
+    }();
+    static const double profile_start = now_seconds();
+    if (profile_at >= 0 && profile_frame_ == UINT64_MAX && now_seconds() - profile_start >= profile_at) {
+        profile_frame_ = frame_number_ + 1;
+        if (profile_pool_ == VK_NULL_HANDLE) {
+            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qci.queryCount = 8192;
+            VK_CHECK(vkCreateQueryPool(ctx_.device, &qci, nullptr, &profile_pool_));
+        }
+        vkCmdResetQueryPool(cmd(), profile_pool_, 0, 8192);
+        profile_marks_.clear();
+        profiling_ = true;
+        profile_mark("start");
+    }
     if (tracing()) std::fprintf(stderr, "trace: swap (end of frame %llu)\n", static_cast<unsigned long long>(frame_number_));
     // TTT2_TRACE_AT=seconds: trace the first frame after that time.
     static const double trace_at = [] {
@@ -498,14 +485,19 @@ void Renderer::swap() {
     if (t - window_start_ >= 10.0) {
         save_pipeline_cache();
         std::fprintf(stderr, "ttt2: gpu: %.1f frames/s, %.0f draws per frame (%.0f skipped), %zu targets, %zu textures, "
-                             "%zu shaders, %zu pipelines; %.1f GPU waits, %.1f ms waiting per frame\n",
+                             "%zu shaders, %zu pipelines; %.1f GPU waits, %.1f ms waiting (%.1f ms GPU busy) per frame; %llu/%llu extra frames blended, %.1f MB recorded; replay %.1f ms (matching %.1f)\n",
                      frames_ / (t - window_start_), double(draws_) / std::max<uint64_t>(frames_, 1),
                      double(skipped_draws_) / std::max<uint64_t>(frames_, 1), targets_.size(), textures_.size(),
                      shaders_.size(), pipelines_.size(), double(waits_) / std::max<uint64_t>(frames_, 1),
-                     wait_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1));
+                     wait_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1), busy_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1),
+                     static_cast<unsigned long long>(blended_replays_),
+                     static_cast<unsigned long long>(replays_), frame_records_[current_record_ ^ 1].used / 1e6,
+                     replay_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1), match_seconds_ * 1000.0 / std::max<uint64_t>(frames_, 1));
+        replay_seconds_ = match_seconds_ = 0;
+        replays_ = blended_replays_ = 0;
         window_start_ = t;
         frames_ = draws_ = skipped_draws_ = waits_ = 0;
-        wait_seconds_ = 0;
+        wait_seconds_ = busy_seconds_ = 0;
     }
 }
 

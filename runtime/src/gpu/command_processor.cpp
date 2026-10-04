@@ -74,13 +74,60 @@ Space g_spaces[kSpaceCount] = {
 uint32_t g_load_control = 0;
 uint32_t g_shadow_enable = 0;
 
+// ---------------------------------------------------------------- frame log
+// With frame interpolation (Backend::frames_per_frame() > 1) the backend
+// renders each finished frame again from a log of what it did, from one
+// swap to the next: the register file at its start, then register writes
+// and operations in order, with their arguments copied. Memory writes,
+// timestamps and waits are not logged, so a replay changes nothing the
+// title can observe.
+struct LogEvent {
+    enum Kind : uint8_t {
+        kRegister, kDraw, kClearColor, kClearDepth, kCopySurface, kResolve, kExpandDepth, kConvertDepth, kCopyToScan
+    };
+    Kind kind;
+    uint32_t a; // register: index; others: offset of the arguments in FrameLog::data
+    uint32_t b; // register: value; draws: offset of copied indices (0: none)
+};
+struct ClearColorArgs { float rgba[4]; gx2::ColorBuffer buffer; };
+struct ClearDepthArgs { uint32_t flags; float depth; uint32_t stencil; gx2::DepthBuffer buffer; };
+struct CopySurfaceArgs { gx2::Surface src; uint32_t src_level, src_slice; gx2::Surface dst; uint32_t dst_level, dst_slice; };
+struct ResolveArgs { gx2::ColorBuffer src; gx2::Surface dst; uint32_t level, slice; };
+struct ConvertDepthArgs { gx2::DepthBuffer src; gx2::Surface dst; uint32_t level, slice; };
+struct CopyToScanArgs { gx2::ColorBuffer buffer; uint32_t target; };
+
+struct FrameLog {
+    bool enabled = false;  // the backend interpolates
+    bool complete = false; // started at a swap
+    std::unique_ptr<Registers> start;
+    std::vector<LogEvent> events;
+    std::vector<uint8_t> data;
+
+    uint32_t store(const void* bytes, size_t size) {
+        const uint32_t offset = static_cast<uint32_t>(data.size());
+        data.resize((data.size() + size + 7) & ~size_t{7});
+        std::memcpy(data.data() + offset, bytes, size);
+        return offset;
+    }
+    template <typename T>
+    void op(LogEvent::Kind kind, const T& args, uint32_t extra = 0) {
+        if (enabled) events.push_back({kind, store(&args, sizeof(T)), extra});
+    }
+};
+FrameLog g_log;
+
+void write_register(uint32_t index, uint32_t value) {
+    g_regs->value[index] = value;
+    if (g_log.enabled) g_log.events.push_back({LogEvent::kRegister, index, value});
+}
+
 uint32_t rd32(uint32_t address) { return byteswap_value(*guest<uint32_t>(address)); }
 void wr32(uint32_t address, uint32_t value) { *guest<uint32_t>(address) = byteswap_value(value); }
 void wr64(uint32_t address, uint64_t value) { *guest<uint64_t>(address) = byteswap_value(value); }
 
 void set_register(uint32_t address, uint32_t value) {
     if (address >= kRegisterSpaceSize) fatal("GPU: register write outside the register space: 0x%05X", address);
-    g_regs->value[address >> 2] = value;
+    write_register(address >> 2, value);
 }
 
 // SET_*: [dword offset within the space, values...]
@@ -93,7 +140,7 @@ void set_registers(SpaceId id, uint32_t payload, uint32_t count) {
         const uint32_t address = space.base + index * 4;
         if (address >= space.end) fatal("GPU: SET packet past the end of its register space (0x%05X)", address);
         const uint32_t value = rd32(payload + i * 4);
-        g_regs->value[address >> 2] = value;
+        write_register(address >> 2, value);
         if (shadowed) wr32(space.shadow + index * 4, value);
     }
 }
@@ -110,7 +157,7 @@ void load_registers(SpaceId id, uint32_t payload, uint32_t count) {
         for (uint32_t j = 0; j < num; ++j) {
             const uint32_t address = space.base + (offset + j) * 4;
             if (address >= space.end) fatal("GPU: LOAD packet past the end of its register space (0x%05X)", address);
-            g_regs->value[address >> 2] = rd32(space.shadow + (offset + j) * 4);
+            write_register(address >> 2, rd32(space.shadow + (offset + j) * 4));
         }
     }
 }
@@ -129,6 +176,112 @@ bool compare(uint32_t function, uint32_t value, uint32_t reference) {
 }
 
 void execute(uint32_t address, uint32_t words, int depth);
+
+// ---------------------------------------------------------------- retirement
+// What the CPU can observe about GPU work (retired timestamps, end-of-pipe
+// memory writes, finished frames) happens once that work has finished on
+// the GPU, in command order, on a thread of its own; meanwhile the command
+// processor goes on with the next commands, as the console's does.
+struct Retirement {
+    enum Kind : uint8_t { kTimestamp, kWrite32, kWrite64, kWriteClock, kFrame } kind;
+    uint64_t done;     // the backend's completion value (Backend::flush)
+    uint32_t address;
+    uint64_t data;
+};
+std::mutex g_retire_mutex;
+std::condition_variable g_retire_cv;
+std::deque<Retirement> g_retire_queue;
+
+void retire_later(const Retirement& r) {
+    std::lock_guard lock(g_retire_mutex);
+    g_retire_queue.push_back(r);
+    g_retire_cv.notify_one();
+}
+
+void retire(uint64_t timestamp);
+void retirement_main() {
+    pthread_setname_np(pthread_self(), "gpu retire");
+    for (;;) {
+        Retirement r;
+        {
+            std::unique_lock lock(g_retire_mutex);
+            g_retire_cv.wait(lock, [] { return !g_retire_queue.empty(); });
+            r = g_retire_queue.front();
+            g_retire_queue.pop_front();
+        }
+        g_backend->wait_for(r.done);
+        switch (r.kind) {
+        case Retirement::kTimestamp: retire(r.data); break;
+        case Retirement::kWrite32: wr32(r.address, static_cast<uint32_t>(r.data)); break;
+        case Retirement::kWrite64: wr64(r.address, r.data); break;
+        case Retirement::kWriteClock: wr64(r.address, clock()); break;
+        case Retirement::kFrame: frame_ready(); break;
+        }
+    }
+}
+
+void start_frame_log() {
+    if (!g_log.start) g_log.start = std::make_unique<Registers>();
+    std::memcpy(g_log.start.get(), g_regs, sizeof(Registers));
+    g_log.events.clear();
+    g_log.data.assign(8, 0); // offset 0 means "no copied indices"
+    g_log.complete = true;
+}
+
+// Renders the logged frame again, as extra frame `n`.
+void replay_frame(uint32_t n) {
+    static Registers* regs = new Registers{};
+    std::memcpy(regs, g_log.start.get(), sizeof(Registers));
+    g_backend->begin_replay(n);
+    const uint8_t* data = g_log.data.data();
+    const auto args = [&](const LogEvent& e) { return data + e.a; };
+    for (const LogEvent& e : g_log.events) {
+        switch (e.kind) {
+        case LogEvent::kRegister: regs->value[e.a] = e.b; break;
+        case LogEvent::kDraw: {
+            Draw draw;
+            std::memcpy(&draw, args(e), sizeof(Draw));
+            if (e.b != 0) draw.host_indices = data + e.b;
+            g_backend->draw(*regs, draw);
+            break;
+        }
+        case LogEvent::kClearColor: {
+            const auto* c = reinterpret_cast<const ClearColorArgs*>(args(e));
+            g_backend->clear_color(*regs, c->buffer, c->rgba);
+            break;
+        }
+        case LogEvent::kClearDepth: {
+            const auto* c = reinterpret_cast<const ClearDepthArgs*>(args(e));
+            g_backend->clear_depth_stencil(*regs, c->buffer, c->flags, c->depth, c->stencil);
+            break;
+        }
+        case LogEvent::kCopySurface: {
+            const auto* c = reinterpret_cast<const CopySurfaceArgs*>(args(e));
+            g_backend->copy_surface(c->src, c->src_level, c->src_slice, c->dst, c->dst_level, c->dst_slice);
+            break;
+        }
+        case LogEvent::kResolve: {
+            const auto* c = reinterpret_cast<const ResolveArgs*>(args(e));
+            g_backend->resolve_color(c->src, c->dst, c->level, c->slice);
+            break;
+        }
+        case LogEvent::kExpandDepth:
+            g_backend->expand_depth(*reinterpret_cast<const gx2::DepthBuffer*>(args(e)));
+            break;
+        case LogEvent::kConvertDepth: {
+            const auto* c = reinterpret_cast<const ConvertDepthArgs*>(args(e));
+            g_backend->convert_depth(c->src, c->dst, c->level, c->slice);
+            break;
+        }
+        case LogEvent::kCopyToScan: {
+            const auto* c = reinterpret_cast<const CopyToScanArgs*>(args(e));
+            g_backend->copy_to_scan_buffer(c->buffer, c->target);
+            break;
+        }
+        }
+    }
+    g_backend->end_replay();
+}
 
 // Stream-out: a draw appends a vertex per index to each enabled buffer.
 void advance_stream_out(uint32_t vertices) {
@@ -185,6 +338,7 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
     case pm4::kDrawIndexAuto: {
         // [count, draw initiator]
         const Draw draw{Draw::kAuto, arg(0), 0, (*g_regs)[reg::VGT_DMA_NUM_INSTANCES], (arg(1) & (1u << 6)) != 0};
+        g_log.op(LogEvent::kDraw, draw);
         dump_shaders(*g_regs);
         g_backend->draw(*g_regs, draw);
         advance_stream_out(draw.count * std::max<uint32_t>(draw.num_instances, 1));
@@ -193,6 +347,7 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
     case pm4::kDrawIndex2: {
         // [max indices, address lo, address hi, count, draw initiator]
         const Draw draw{Draw::kIndexBuffer, arg(3), arg(1), (*g_regs)[reg::VGT_DMA_NUM_INSTANCES], false};
+        g_log.op(LogEvent::kDraw, draw);
         dump_shaders(*g_regs);
         g_backend->draw(*g_regs, draw);
         advance_stream_out(draw.count * std::max<uint32_t>(draw.num_instances, 1));
@@ -201,6 +356,14 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
     case pm4::kDrawIndexImmd: {
         // [count, draw initiator, indices...]
         const Draw draw{Draw::kImmediate, arg(0), payload + 8, (*g_regs)[reg::VGT_DMA_NUM_INSTANCES], false};
+        if (g_log.enabled) {
+            // The indices follow in the command buffer, which the title reuses.
+            const uint32_t bytes = (count - 2) * 4;
+            std::vector<uint8_t> indices(bytes);
+            std::memcpy(indices.data(), guest<uint8_t>(payload + 8), bytes);
+            const uint32_t at = g_log.store(indices.data(), bytes);
+            g_log.op(LogEvent::kDraw, draw, at);
+        }
         dump_shaders(*g_regs);
         g_backend->draw(*g_regs, draw);
         advance_stream_out(draw.count * std::max<uint32_t>(draw.num_instances, 1));
@@ -217,12 +380,11 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
     case pm4::kEventWriteEop: {
         // [event initiator, address lo, address hi (data/interrupt select), data lo, data hi]
         // Written once everything before it has finished.
-        g_backend->sync();
         const uint32_t target = arg(1) & ~3u;
         switch (arg(2) >> 29) {
-        case 1: wr32(target, arg(3)); break;
-        case 2: wr64(target, (uint64_t{arg(4)} << 32) | arg(3)); break;
-        case 3: wr64(target, clock()); break;
+        case 1: retire_later({Retirement::kWrite32, g_backend->flush(), target, arg(3)}); break;
+        case 2: retire_later({Retirement::kWrite64, g_backend->flush(), target, (uint64_t{arg(4)} << 32) | arg(3)}); break;
+        case 3: retire_later({Retirement::kWriteClock, g_backend->flush(), target, 0}); break;
         default: break;
         }
         break;
@@ -276,23 +438,39 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
 
     case pm4::kHleSwapBuffers:
         g_backend->swap();
-        frame_ready();
+        if (g_log.enabled) {
+            // The replays read the frame's guest memory again: the title
+            // learns the frame is done (and may reuse its buffers) after them.
+            if (g_log.complete) {
+                for (uint32_t n = 1; n < g_backend->frames_per_frame(); ++n) replay_frame(n);
+            }
+            g_backend->frame_shown();
+            start_frame_log();
+        }
+        retire_later({Retirement::kFrame, g_backend->flush(), 0, 0});
         break;
     case pm4::kHleCopyColorToScan:
+        g_log.op(LogEvent::kCopyToScan, CopyToScanArgs{*guest<gx2::ColorBuffer>(payload + 4), arg(0)});
         g_backend->copy_to_scan_buffer(*guest<gx2::ColorBuffer>(payload + 4), arg(0));
         break;
     case pm4::kHleClearColor: {
         float rgba[4];
         for (int i = 0; i < 4; ++i) rgba[i] = std::bit_cast<float>(arg(i));
+        g_log.op(LogEvent::kClearColor, ClearColorArgs{{rgba[0], rgba[1], rgba[2], rgba[3]}, *guest<gx2::ColorBuffer>(payload + 16)});
         g_backend->clear_color(*g_regs, *guest<gx2::ColorBuffer>(payload + 16), rgba);
         break;
     }
     case pm4::kHleClearDepthStencil:
+        g_log.op(LogEvent::kClearDepth, ClearDepthArgs{arg(0), std::bit_cast<float>(arg(1)), arg(2),
+                                                       *guest<gx2::DepthBuffer>(payload + 12)});
         g_backend->clear_depth_stencil(*g_regs, *guest<gx2::DepthBuffer>(payload + 12), arg(0),
                                        std::bit_cast<float>(arg(1)), arg(2));
         break;
     case pm4::kHleCopySurface: {
         const uint32_t dst = payload + sizeof(gx2::Surface) + 8;
+        g_log.op(LogEvent::kCopySurface,
+                 CopySurfaceArgs{*guest<gx2::Surface>(payload), rd32(dst - 8), rd32(dst - 4), *guest<gx2::Surface>(dst),
+                                 rd32(dst + sizeof(gx2::Surface)), rd32(dst + sizeof(gx2::Surface) + 4)});
         g_backend->copy_surface(*guest<gx2::Surface>(payload), rd32(dst - 8), rd32(dst - 4),
                                 *guest<gx2::Surface>(dst), rd32(dst + sizeof(gx2::Surface)),
                                 rd32(dst + sizeof(gx2::Surface) + 4));
@@ -300,15 +478,21 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t 
     }
     case pm4::kHleResolveColor: {
         const uint32_t dst = payload + sizeof(gx2::ColorBuffer);
+        g_log.op(LogEvent::kResolve, ResolveArgs{*guest<gx2::ColorBuffer>(payload), *guest<gx2::Surface>(dst),
+                                                 rd32(dst + sizeof(gx2::Surface)), rd32(dst + sizeof(gx2::Surface) + 4)});
         g_backend->resolve_color(*guest<gx2::ColorBuffer>(payload), *guest<gx2::Surface>(dst),
                                  rd32(dst + sizeof(gx2::Surface)), rd32(dst + sizeof(gx2::Surface) + 4));
         break;
     }
     case pm4::kHleExpandDepth:
+        g_log.op(LogEvent::kExpandDepth, *guest<gx2::DepthBuffer>(payload));
         g_backend->expand_depth(*guest<gx2::DepthBuffer>(payload));
         break;
     case pm4::kHleConvertDepth: {
         const uint32_t dst = payload + sizeof(gx2::DepthBuffer);
+        g_log.op(LogEvent::kConvertDepth, ConvertDepthArgs{*guest<gx2::DepthBuffer>(payload), *guest<gx2::Surface>(dst),
+                                                           rd32(dst + sizeof(gx2::Surface)),
+                                                           rd32(dst + sizeof(gx2::Surface) + 4)});
         g_backend->convert_depth(*guest<gx2::DepthBuffer>(payload), *guest<gx2::Surface>(dst),
                                  rd32(dst + sizeof(gx2::Surface)), rd32(dst + sizeof(gx2::Surface) + 4));
         break;
@@ -360,6 +544,7 @@ void retire(uint64_t timestamp) {
 }
 
 void command_processor_main() {
+    pthread_setname_np(pthread_self(), "gpu");
     for (;;) {
         Submission s;
         {
@@ -377,8 +562,7 @@ void command_processor_main() {
             for (const auto& [address, size] : written) g_backend->cpu_wrote(address, size);
         }
         execute(s.buffer, s.words, 0);
-        g_backend->sync();
-        retire(s.timestamp);
+        retire_later({Retirement::kTimestamp, g_backend->flush(), 0, s.timestamp});
     }
 }
 
@@ -394,7 +578,9 @@ void start() {
         if (host::window_open() && !(choice && std::strcmp(choice, "null") == 0)) g_backend = make_vulkan_backend();
         else g_backend = make_null_backend();
         std::fprintf(stderr, "ttt2: GPU backend: %s\n", g_backend->name());
+        g_log.enabled = g_backend->frames_per_frame() > 1;
         std::thread(command_processor_main).detach();
+        std::thread(retirement_main).detach();
         start_display();
     });
 }

@@ -87,6 +87,9 @@ struct TranslatedShader {
     uint32_t texture_mask = 0;   // texture slots the shader samples
     uint32_t shadow_mask = 0;    // slots sampled with a depth compare (SAMPLE_C*)
     bool uses_registers = false; // reads the uniform register binding
+    uint32_t constant_bank_mask = 0; // uniform blocks (kcache banks) read
+    uint32_t constant_bank_extent[16] = {}; // bytes of each read from its start (UINT32_MAX: any, relative index)
+    uint32_t buffer_mask = 0;        // buffer resources fetched from (VTX_FETCH in TEX clauses)
 };
 
 // The environment of a draw's `stage` shader from the GPU register file

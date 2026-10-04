@@ -120,6 +120,12 @@ void Context::init(const std::vector<const char*>& instance_extensions) {
         }
     }
     if (queue_family == UINT32_MAX) fatal("Vulkan: no graphics queue");
+    for (uint32_t i = 0; i < family_count; ++i) {
+        if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+            present_family = i;
+            break;
+        }
+    }
 
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(physical, nullptr, &n, nullptr);
@@ -184,20 +190,27 @@ void Context::init(const std::vector<const char*>& instance_extensions) {
     ef.fragmentStoresAndAtomics = af.fragmentStoresAndAtomics;
     ef.shaderImageGatherExtended = af.shaderImageGatherExtended;
     ef.depthBounds = af.depthBounds;
+    ef.shaderStorageImageWriteWithoutFormat = af.shaderStorageImageWriteWithoutFormat;
+    storage_without_format = af.shaderStorageImageWriteWithoutFormat;
 
     const float priority = 1.0f;
-    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    qci.queueFamilyIndex = queue_family;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &priority;
+    VkDeviceQueueCreateInfo qci[2]{};
+    qci[0].sType = qci[1].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qci[0].queueFamilyIndex = queue_family;
+    qci[0].queueCount = 1;
+    qci[0].pQueuePriorities = &priority;
+    qci[1].queueFamilyIndex = present_family;
+    qci[1].queueCount = 1;
+    qci[1].pQueuePriorities = &priority;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &e2;
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &qci;
+    dci.queueCreateInfoCount = present_family != UINT32_MAX ? 2 : 1;
+    dci.pQueueCreateInfos = qci;
     dci.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
     dci.ppEnabledExtensionNames = device_extensions.data();
     VK_CHECK(vkCreateDevice(physical, &dci, nullptr, &device));
     vkGetDeviceQueue(device, queue_family, 0, &queue);
+    if (present_family != UINT32_MAX) vkGetDeviceQueue(device, present_family, 0, &present_queue);
     get_memory_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
         vkGetDeviceProcAddr(device, "vkGetMemoryHostPointerPropertiesEXT"));
     cmd_push_descriptor_set =
@@ -343,9 +356,10 @@ void UploadRing::init(Context& c, VkDeviceSize size) {
 }
 
 uint8_t* UploadRing::allocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset) {
-    const VkDeviceSize start = (used_ + alignment - 1) / alignment * alignment;
-    if (start + size > buffer_.size) return nullptr;
-    used_ = start + size;
+    const VkDeviceSize base = chunk_ * chunk_size();
+    const VkDeviceSize start = (base + used_ + alignment - 1) / alignment * alignment;
+    if (start + size > base + chunk_size()) return nullptr;
+    used_ = start + size - base;
     offset = start;
     return buffer_.mapped + start;
 }

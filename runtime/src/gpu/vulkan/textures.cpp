@@ -145,6 +145,9 @@ Texture* Renderer::texture(const uint32_t words[7]) {
         t->memory[0][1] = s.image + s.image_size;
         t->memory[1][0] = s.mipmaps;
         t->memory[1][1] = s.mip_levels > 1 ? uint32_t{s.mipmaps} + s.mipmap_size : uint32_t{s.mipmaps};
+        for (const auto& range : t->memory) {
+            if (range[1] > range[0]) for_pages(range[0], range[1], [&](uint32_t page) { texture_pages_[page].push_back(t.get()); });
+        }
         entry = std::move(t);
     }
     load_texture(*entry);
@@ -187,23 +190,34 @@ void Renderer::create_texture_image(Texture& t, uint32_t scale) {
 }
 
 void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height) {
+    note_target_read(&src);
     const uint32_t bytes = src.image.format == VK_FORMAT_D16_UNORM ? 2 : 4;
     if (t.scale != src.scale) create_texture_image(t, src.scale);
     width = std::min({width * src.scale, src.image.width, t.image.width});
     height = std::min({height * src.scale, src.image.height, t.image.height});
-    VkDeviceSize offset = 0;
-    upload(VkDeviceSize{width} * height * bytes, 16, offset);
+    // Through a buffer in video memory: depth and colour images do not
+    // copy directly. (The barriers order reuse across submissions.)
+    const VkDeviceSize size = VkDeviceSize{width} * height * bytes;
+    if (depth_staging_.size < size) {
+        if (depth_staging_.buffer != VK_NULL_HANDLE) {
+            submit(true);
+            ctx_.destroy_buffer(depth_staging_);
+        }
+        depth_staging_ = ctx_.create_buffer(std::max<VkDeviceSize>(size, 64u << 20),
+                                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
     end_rendering();
     barrier();
     VkBufferImageCopy region{};
-    region.bufferOffset = offset;
     region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
     region.imageExtent = {width, height, 1};
-    vkCmdCopyImageToBuffer(cmd(), src.image.image, VK_IMAGE_LAYOUT_GENERAL, ring_.buffer(), 1, &region);
+    vkCmdCopyImageToBuffer(cmd(), src.image.image, VK_IMAGE_LAYOUT_GENERAL, depth_staging_.buffer, 1, &region);
     barrier();
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    vkCmdCopyBufferToImage(cmd(), ring_.buffer(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    vkCmdCopyBufferToImage(cmd(), depth_staging_.buffer, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     barrier();
+    profile_mark("depth to texture", src.address, width, height);
 }
 
 static void report_target_texture_once(uint32_t format, uint32_t scale) {
@@ -249,6 +263,7 @@ bool Renderer::load_texture_from_targets(Texture& t) {
             continue;
         }
         sources[level] = src;
+        note_target_read(src);
         newest = std::max(newest, src->written);
     }
     if (t.source == sources[0] && t.loaded >= newest && t.scale == sources[0]->scale) return true;
@@ -277,6 +292,7 @@ bool Renderer::load_texture_from_targets(Texture& t) {
                        &region);
     }
     barrier();
+    profile_mark("texture from target", sources[0]->address, r.width * scale, r.height * scale);
     t.source = sources[0];
     t.loaded = stamp();
     t.dirty = false;
@@ -312,6 +328,8 @@ void Renderer::load_texture(Texture& t) {
     // wrote the memory, hold the contents.
     if (load_texture_from_targets(t)) return;
     if (!t.dirty && t.source == nullptr) return;
+    // A replay renders the frame's data again: what the CPU wrote since is the next frame's.
+    if (replaying_ && t.loaded != 0) return;
 
     const gx2::Surface s = surface_of(r);
     if (!guest_memory_committed(s.image, s.image_size) ||
@@ -375,6 +393,7 @@ void Renderer::load_texture(Texture& t) {
         vkCmdCopyBufferToImage(cmd(), ring_.buffer(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     }
     barrier();
+    profile_mark("texture upload", uint32_t{s.image}, r.width, r.height);
     // TTT2_DUMP_TEXTURES=<directory>: every texture loaded from memory, as PNG.
     static const char* dump = std::getenv("TTT2_DUMP_TEXTURES");
     if (dump && r.dim == gx2::kDim2D) {
@@ -395,9 +414,32 @@ void Renderer::load_texture(Texture& t) {
     }
 }
 
+void Renderer::mark_textures_dirty(uint32_t address, uint64_t end) {
+    if (end - address > (64u << 20)) { // huge: every texture
+        for (auto& [key, t] : textures_) {
+            for (const auto& range : t->memory) {
+                if (range[0] < end && range[1] > address) t->dirty = true;
+            }
+        }
+        return;
+    }
+    for_pages(address, end, [&](uint32_t page) {
+        const auto it = texture_pages_.find(page);
+        if (it == texture_pages_.end()) return;
+        for (Texture* t : it->second) {
+            for (const auto& range : t->memory) {
+                if (range[0] < end && range[1] > address) t->dirty = true;
+            }
+        }
+    });
+}
+
 void Renderer::invalidate(uint32_t address, uint32_t size, uint32_t coherency_flags) {
-    if (const char* w = std::getenv("TTT2_WATCH")) {
-        const uint32_t watch = static_cast<uint32_t>(std::strtoul(w, nullptr, 16));
+    static const uint32_t watch = [] {
+        const char* w = std::getenv("TTT2_WATCH");
+        return w ? static_cast<uint32_t>(std::strtoul(w, nullptr, 16)) : 0u;
+    }();
+    if (watch) {
         if (address < uint64_t{watch} + 0x30000 && uint64_t{address} + size > watch) {
             std::fprintf(stderr, "watch: surface sync 0x%08X+0x%X flags 0x%08X (frame %llu)\n", address, size,
                          coherency_flags, static_cast<unsigned long long>(frame_number_));
@@ -409,15 +451,11 @@ void Renderer::invalidate(uint32_t address, uint32_t size, uint32_t coherency_fl
     // Titles flush the whole cache every frame; CPU writes come through
     // cpu_wrote(), so only a ranged invalidation suggests changed data.
     if (size >= 0x80000000u) return;
-    const uint64_t end = uint64_t{address} + size;
-    for (auto& [key, t] : textures_) {
-        for (const auto& range : t->memory) {
-            if (range[0] < end && range[1] > address) t->dirty = true;
-        }
-    }
+    mark_textures_dirty(address, uint64_t{address} + size);
 }
 
 void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
+    if (frames_per_frame_ > 1) forget_snapshots(address, size);
     const uint64_t end = uint64_t{address} + size;
     static const uint32_t watch = [] {
         const char* w = std::getenv("TTT2_WATCH");
@@ -427,25 +465,29 @@ void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
         std::fprintf(stderr, "watch: cpu wrote 0x%08X-0x%08X (frame %llu)\n", address, static_cast<uint32_t>(end),
                      static_cast<unsigned long long>(frame_number_));
     }
-    for (auto& [key, t] : textures_) {
-        for (const auto& range : t->memory) {
-            if (range[0] < end && range[1] > address) t->dirty = true;
-        }
-    }
+    if (size == 0) return;
+    mark_textures_dirty(address, end);
     // The CPU's data is newer than a render target over the same memory.
     // (A flush of everything says nothing about render targets.)
     if (size < 0x10000000) {
-        const uint64_t now = stamp();
+        uint64_t now = 0;
         for (auto& t : targets_) {
-            const uint64_t bytes = uint64_t{t->pitch} * t->height * std::max(1u, color_format(t->format).bytes);
-            if (t->address < end && t->address + bytes > address) t->overwritten = now;
+            if (t->address < end && t->end > address) t->overwritten = now ? now : (now = stamp());
         }
     }
-    for (auto it = programs_.begin(); it != programs_.end();) {
-        const uint32_t p_address = static_cast<uint32_t>(it->first >> 32), p_size = static_cast<uint32_t>(it->first);
-        if (p_address < end && uint64_t{p_address} + p_size > address) it = programs_.erase(it);
-        else ++it;
+    if (end - address > (64u << 20)) {
+        programs_.clear();
+        program_pages_.clear();
+        return;
     }
+    for_pages(address, end, [&](uint32_t page) {
+        const auto pages = program_pages_.find(page);
+        if (pages == program_pages_.end()) return;
+        for (uint64_t key : pages->second) {
+            const uint32_t p_address = static_cast<uint32_t>(key >> 32), p_size = static_cast<uint32_t>(key);
+            if (p_address < end && uint64_t{p_address} + p_size > address) programs_.erase(key);
+        }
+    });
 }
 
 // ---------------------------------------------------------------- samplers

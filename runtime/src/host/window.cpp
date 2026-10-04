@@ -19,6 +19,7 @@ namespace {
 SDL_Window* g_window = nullptr;
 std::atomic<uint32_t> g_width{1280}, g_height{720};
 std::atomic<uint32_t> g_display_width{1280}, g_display_height{720};
+std::atomic<float> g_display_refresh{60.0f};
 
 // Keyboard layout: arrows for the D-pad; X/Z/S/A for A/B/X/Y (the GamePad's
 // diamond); Q/W for L/R, 1/2 for ZL/ZR; Enter Plus, Backspace Minus, H Home;
@@ -110,6 +111,9 @@ bool open_window(const char* title) {
     if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay())) {
         g_display_width = static_cast<uint32_t>(mode->w * mode->pixel_density);
         g_display_height = static_cast<uint32_t>(mode->h * mode->pixel_density);
+        if (const SDL_DisplayMode* current = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay())) {
+            g_display_refresh = current->refresh_rate;
+        }
         const int fit = std::max(1, std::min((mode->w - 64) / 640, (mode->h - 128) / 360));
         window_w = 640 * fit;
         window_h = 360 * fit;
@@ -165,6 +169,8 @@ VkSurfaceKHR create_vulkan_surface(VkInstance instance) {
     }
     return surface;
 }
+
+float display_refresh_rate() { return g_display_refresh; }
 
 void display_size(uint32_t& width, uint32_t& height) {
     width = g_display_width;

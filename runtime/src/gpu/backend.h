@@ -26,6 +26,9 @@ struct Draw {
     uint32_t index_address; // guest address of the indices (index buffer or the packet)
     uint32_t num_instances;
     bool use_opaque; // stream-out draw: the count comes from the stream-out buffer
+    // Indices copied out of the command buffer (replayed immediate draws);
+    // used instead of index_address when set.
+    const uint8_t* host_indices = nullptr;
 };
 
 class Backend {
@@ -55,6 +58,23 @@ public:
     // command processor makes the CPU see that it has (retired timestamps,
     // end-of-pipe writes).
     virtual void sync() {}
+    // Submits what has been requested so far without waiting; returns a
+    // value wait_for() accepts once that work has finished on the GPU.
+    virtual uint64_t flush() {
+        sync();
+        return 0;
+    }
+    virtual void wait_for(uint64_t) {}
+
+    // Frame interpolation. A backend that shows more than one frame per
+    // frame the title renders gets each finished frame's commands again
+    // (register writes and operations, nothing the CPU can observe) once per
+    // extra frame, between begin_replay(n) and end_replay(), n = 1 ..
+    // frames_per_frame() - 1, after swap(). Then frame_shown() follows.
+    virtual uint32_t frames_per_frame() const { return 1; }
+    virtual void begin_replay(uint32_t) {}
+    virtual void end_replay() {}
+    virtual void frame_shown() {}
 };
 
 std::unique_ptr<Backend> make_null_backend();
