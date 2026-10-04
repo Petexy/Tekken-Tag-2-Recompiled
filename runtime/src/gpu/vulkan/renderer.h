@@ -269,8 +269,9 @@ private:
     void show_extra_frame();
     void finish_frame_presentation();
     void presenter_main();
-    void present_timed();
-    void present_every_refresh();
+    void choose_presentation(double hz);
+    void present_timed(float reported_hz);
+    void present_every_refresh(float reported_hz);
     void note_presentation(double scheduled, double presented);
     void create_swapchain(VkFormat image_format);
     // Presents image `index` once its copy (timeline value `ready`) is done;
@@ -289,7 +290,7 @@ private:
         // vblank its frame started from, whether it is its frame's first
         // image, and whether it was found complete.
         int64_t due = 0, tick = 0;
-        bool first = false, seen_ready = false;
+        bool first = false, seen_ready = false, counted_late = false;
     };
     void queue_present(const QueuedFrame& f);
     std::deque<QueuedFrame> present_queue_;
@@ -309,9 +310,21 @@ private:
     // refreshes refreshes_per_frame_ times per title frame: the
     // presentation thread drives the title's vblanks, frames are due at
     // refresh counts.
-    bool every_refresh_ = false;
-    uint64_t swapchain_generation_ = 0; // counts swapchain creations (presentation thread)
-    uint32_t refreshes_per_frame_ = 1;
+    std::atomic<bool> every_refresh_{false};
+    bool present_waits_ = false;           // the surface tells when presents reach the screen
+    bool swapchain_every_refresh_ = false; // the mode the swapchain was made for (presentation thread)
+    uint64_t swapchain_generation_ = 0;    // counts swapchain creations (presentation thread)
+    uint64_t present_id_ = 0;              // the last present id used (presentation thread)
+    // Presenting every refresh (presentation thread): the refresh the last
+    // present seen on screen showed at, and the last title vblank's; kept
+    // across mode changes so frames' due refreshes stay comparable.
+    int64_t refresh_count_ = 0, last_tick_ = -1;
+    double measured_hz_ = 0;               // presentation thread: the window's display measured unlike reported
+    // Under present_mutex_: the GPU thread is replacing the presentation
+    // images and waits for the presentation thread to let go of them.
+    bool present_release_ = false;
+    std::atomic<uint32_t> stolen_images_{0}; // taken back from the queue unshown (statistics)
+    std::atomic<uint32_t> refreshes_per_frame_{1};
     double refresh_period_ = 1.0 / 60.0;          // seconds
     std::atomic<int64_t> tick_refresh_{0};        // refresh of the last title vblank
     std::atomic<double> tick_time_{0};            // and when it was seen
@@ -337,6 +350,7 @@ private:
     int64_t captured_frame_ = -1; // TTT2_CAPTURE: frame number and index of the last capture
     uint32_t captured_index_ = 0;
     uint32_t sequence_left_ = 0, sequence_frame_ = 0; // TTT2_CAPTURE_SEQUENCE: frames still to save
+    uint32_t sequence_index_ = 0;                     // and the capture it follows
     bool sequence_saving_ = false;
     void save_sequence_image(uint32_t n);
 

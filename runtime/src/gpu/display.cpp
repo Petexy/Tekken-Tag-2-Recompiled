@@ -36,15 +36,16 @@ void flip(uint64_t now) {
     g_last_flip_vsync = g_vsyncs;
 }
 
-// Steady-clock nanoseconds of the last host_vsync.
+// Steady-clock nanoseconds of the last host_vsync, and the blanks the
+// timer gave since (under the kernel lock).
 std::atomic<int64_t> g_last_host_vsync{0};
+uint32_t g_timer_vsyncs = 0;
 
 int64_t steady_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void vsync() {
-    os::KernelLock lock(os::kernel_mutex());
+void vsync_locked() {
     const uint64_t now = cafe_ppc_timebase();
     ++g_vsyncs;
     g_last_vsync = now;
@@ -60,11 +61,18 @@ void display_main() {
         next += kRefreshPeriod;
         std::this_thread::sleep_until(next);
         // The host display's blanks stand in while they come.
-        if (steady_ns() - g_last_host_vsync.load() < 3 * kRefreshPeriod.count()) {
+        if (steady_ns() - g_last_host_vsync.load() < 2 * kRefreshPeriod.count()) {
             next = std::chrono::steady_clock::now();
             continue;
         }
-        vsync();
+        {
+            os::KernelLock lock(os::kernel_mutex());
+            if (steady_ns() - g_last_host_vsync.load() >= 2 * kRefreshPeriod.count()) {
+                // (At most the blanks a host catch-up reports.)
+                g_timer_vsyncs = std::min(g_timer_vsyncs + 1, 4u);
+                vsync_locked();
+            }
+        }
         // Far behind (debugger, suspended process): resynchronise.
         if (std::chrono::steady_clock::now() - next > kRefreshPeriod * 10) next = std::chrono::steady_clock::now();
     }
@@ -72,9 +80,18 @@ void display_main() {
 
 } // namespace
 
-void host_vsync() {
+void host_vsync(uint32_t count) {
+    os::KernelLock lock(os::kernel_mutex());
     g_last_host_vsync.store(steady_ns());
-    vsync();
+    // Blanks the timer gave while the host's stopped count against these.
+    const uint32_t covered = std::min(count, g_timer_vsyncs);
+    g_timer_vsyncs -= covered;
+    for (uint32_t i = covered; i < count; ++i) vsync_locked();
+}
+
+void forget_timer_vsyncs() {
+    os::KernelLock lock(os::kernel_mutex());
+    g_timer_vsyncs = 0;
 }
 
 void start_display() {

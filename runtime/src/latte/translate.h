@@ -29,6 +29,10 @@ enum class TextureKind : uint8_t { kFloat, kUint, kSint };
 struct ShaderEnvironment {
     Stage stage = Stage::kVertex;
     bool uniform_registers = false; // constants come from C0-C255 (SQ_CONFIG.DX9_CONSTS), not kcache
+    // SQ_PGM_RESOURCES_*.NUM_GPRS: the registers the program has, which
+    // relative addressing ranges over. A property of the program (so not
+    // part of the key).
+    uint8_t num_gprs = 0;
 
     struct Texture {
         uint8_t dim = 1; // SQ_TEX_DIM (gx2::SurfaceDim)

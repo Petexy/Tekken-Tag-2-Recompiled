@@ -180,7 +180,15 @@ reads every operand before it writes, PV/PS carry the previous group's
 results, and DX9-style `MUL`/`MULADD`/`DOT4` treat 0 × anything as 0. The
 per-thread active mask and push/pop stack are variables, so every clause
 is guarded and the jumps that only skip inactive threads are dropped;
-DX10 loops become `while` loops with `break`. What the microcode does not
+DX10 loops become `while` loops with `break`. Relative register addressing
+(`R[base + AR]`, used by loops over register arrays such as the main
+menu's depth-of-field blur) goes through `rel_load`/`rel_store`, which
+switch over the program's registers (`SQ_PGM_RESOURCES.NUM_GPRS`) so the
+register file is only ever indexed by constants: indexing it directly
+made the driver keep all 128 registers in scratch memory, and that one
+blur took 16.5 ms a pass at 1440p (now 0.07 ms; every shader the title
+uses through a match compiles with no scratch memory, checked with
+`RADV_DEBUG=shaderstats`). What the microcode does not
 decide (vertex semantics, the VS→PS parameter linkage, texture types,
 render target number types, alpha test, point sprites, stream-out) comes
 from the register file (`environment.cpp`) and is part of the shader key.
@@ -267,24 +275,39 @@ attachment formats and blend state.
   compute queue (AMD's asynchronous compute, `TTT2_PRESENT_BLIT=1` for
   the rendering queue): a present there waits only for its own frame, not
   for rendering queued after it. A compute shader scales the frame,
-  letterboxed, into the swapchain. On a display refreshing at a multiple
-  of 60 Hz with present waits (`VK_KHR_present_wait2`), the thread
-  presents at every refresh in FIFO order, three presents ahead of the
-  screen (KWin latches a commit about two refreshes before showing it, and
-  tells late that it did), and counts refreshes as each reaches the
-  screen: every 60th of a second of them is the title's vertical blank
-  (`gpu::host_vsync`; the 59.94 Hz timer stands in when they stop, e.g.
-  for a hidden window), and each frame's images are due at fixed
+  letterboxed, into the swapchain. The mode follows the display the
+  window is on, chosen again when the window moves to another display or
+  its mode changes. On a display refreshing at a multiple of 60 Hz of at
+  least 120 Hz with present waits (`VK_KHR_present_wait2`), the thread
+  presents at every refresh in FIFO order, a few presents ahead of the
+  screen (about 8 ms: 3 at 240 Hz, 2 at 120 Hz; KWin latches a commit
+  about two refreshes before showing it, and tells late that it did), and
+  counts refreshes one per present reaching the screen, plus, by time
+  since the last present it waited for, any refresh the screen showed
+  twice (once the next present confirms it: a single late wake-up is not
+  one) and, when it fell behind, the time that passed. Every 60th of a second of them is the title's vertical blank
+  (`gpu::host_vsync`; the 59.94 Hz timer stands in when they stop for two
+  frames, e.g. for a hidden window, and the blanks it gives count against
+  the host's when they resume), and each frame's images are due at fixed
   refreshes after the vblank its frame started from, the extra frames
   first and the real one last. So the title runs at the display's own
   rate (59.99 Hz on a 239.97 Hz display) and every image stays on screen
   for the same number of refreshes: measured in fights at 2x on a 240 Hz
   KWin desktop, 99% of images shown for exactly two refreshes (before,
-  frames timed by the clock alone came 6 to 11 ms apart). The lead from
-  vblank to the first image is what frames needed over the last ten
-  seconds, all but the slowest 1%, raised at once when frames keep coming
-  late (7-9 refreshes, ~30-37 ms, in fights). On other displays
-  (`TTT2_PRESENT_TIMED=1` forces it) frames get display slots one title
+  frames timed by the clock alone came 6 to 11 ms apart). The time
+  between presents it waited for checks the reported rate: a display
+  refreshing more than 2% faster (in two windows of 240 presents in a
+  row) chooses the mode again with the measured rate; a slower one, or a
+  compositor skipping refreshes, is already counted by time
+  (`TTT2_DISPLAY_HZ` fakes a reported rate to test this). Presents that fail or do not reach the screen show the newest
+  finished image at once, so the queue keeps moving; when the renderer
+  replaces the presentation images (the TV buffer changed size) the
+  thread lets go of them first. The lead from vblank to the first image
+  is what frames needed over the last ten seconds, all but the slowest
+  1%, raised at once when frames keep coming late (7-9 refreshes,
+  ~30-37 ms, in fights). On other displays, including 60 Hz ones where
+  presenting every refresh would only add its queue's latency
+  (`TTT2_PRESENT_TIMED=1` forces it), frames get display slots one title
   frame apart (re-anchored when the title falls behind) at a lead after
   their swap and are presented at those times (mailbox). With
   interpolation the real image is shown half a frame later than
@@ -339,7 +362,8 @@ per frame every ten seconds. Renderer debugging:
 | `TTT2_INTERP_TEST=1` | replays without blending: extra frames must equal real ones |
 | `TTT2_INTERP_2D=1` | blend flat (not depth-tested) draws too |
 | `TTT2_PRESENT_TIMED=1` | present at chosen times instead of at every refresh |
-| `TTT2_PRESENT_QUEUE=1..4` | presents kept ahead of the screen when presenting every refresh (default 3) |
+| `TTT2_PRESENT_QUEUE=1..4` | presents kept ahead of the screen when presenting every refresh (default about 8 ms of refreshes) |
+| `TTT2_DISPLAY_HZ=<hz>` | report this refresh rate for the window's display (tests the rate check) |
 | `TTT2_FULLSCREEN=1` | start fullscreen |
 | `TTT2_TRACE_INTERP=1`, `TTT2_TRACE_PACING=1` | draw matching, carried targets; frame readiness, swap times after the vblank |
 | `TTT2_PROFILE_AT=<s>` | GPU time of every operation of one frame |

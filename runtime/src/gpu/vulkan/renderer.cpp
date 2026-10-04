@@ -405,12 +405,13 @@ void Renderer::capture() {
     if (sequence_left_ == 0 && sequence > 0) {
         sequence_left_ = sequence;
         sequence_frame_ = 0;
+        sequence_index_ = captured_index_;
     }
 }
 
 void Renderer::save_sequence_image(uint32_t n) {
     char name[64];
-    std::snprintf(name, sizeof(name), "/seq_%04u_%03u_%u.png", captured_index_, sequence_frame_, n);
+    std::snprintf(name, sizeof(name), "/seq_%04u_%03u_%u.png", sequence_index_, sequence_frame_, n);
     save_image(scan_[0], std::string(std::getenv("TTT2_CAPTURE")) + name);
 }
 

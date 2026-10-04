@@ -14,6 +14,7 @@ void build_environment(const uint32_t* regs, Stage stage, ShaderEnvironment& env
     env = ShaderEnvironment{};
     env.stage = stage;
     env.uniform_registers = (r(reg::SQ_CONFIG) >> 2) & 1; // DX9_CONSTS
+    env.num_gprs = static_cast<uint8_t>(r(stage == Stage::kVertex ? reg::SQ_PGM_RESOURCES_VS : reg::SQ_PGM_RESOURCES_PS));
 
     const uint32_t texture_base = stage == Stage::kVertex ? resource::kVsTexture : resource::kPsTexture;
     for (uint32_t slot = 0; slot < 18; ++slot) {

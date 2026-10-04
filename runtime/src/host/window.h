@@ -29,5 +29,8 @@ void drawable_size(uint32_t& width, uint32_t& height);
 void display_size(uint32_t& width, uint32_t& height);
 // The primary display's refresh rate, in Hz.
 float display_refresh_rate();
+// The refresh rate of the display the window is on, in Hz (it follows the
+// window to other displays; the primary's before the window opens).
+float window_refresh_rate();
 
 } // namespace cafe::host

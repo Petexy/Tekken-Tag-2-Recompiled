@@ -87,10 +87,9 @@ void Renderer::start_presenter() {
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx_.physical, surface_, &caps));
     compute_present_ = supported && ctx_.storage_without_format && (caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) &&
                        !std::getenv("TTT2_PRESENT_BLIT");
-    // Presenting every refresh: present waits on this surface, and a
-    // display refreshing a whole number of times per title frame that the
-    // frame's images divide evenly.
-    bool waits = false;
+    // Whether the surface tells when presents reach the screen (needed to
+    // present every refresh; the mode itself is chosen by the presentation
+    // thread, for the display the window is on).
     if (ctx_.present_wait) {
         const auto get_caps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
             vkGetInstanceProcAddr(ctx_.instance, "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
@@ -101,27 +100,12 @@ void Renderer::start_presenter() {
         caps2.pNext = &id2;
         VkPhysicalDeviceSurfaceInfo2KHR info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
         info.surface = surface_;
-        waits = get_caps2 != nullptr && get_caps2(ctx_.physical, &info, &caps2) == VK_SUCCESS && id2.presentId2Supported &&
-                wait2.presentWait2Supported;
-    }
-    const double hz = host::display_refresh_rate();
-    const uint32_t per_frame = static_cast<uint32_t>(std::lround(hz / 60.0));
-    every_refresh_ = waits && per_frame >= 1 && std::fabs(hz / 60.0 - per_frame) < 0.01 * per_frame &&
-                     per_frame % frames_per_frame_ == 0 && !std::getenv("TTT2_PRESENT_TIMED");
-    if (every_refresh_) {
-        refreshes_per_frame_ = per_frame;
-        refresh_period_ = 1.0 / hz;
-        // Adapted to what frames need from the first frames on.
-        refresh_lead_.store(static_cast<int32_t>(per_frame + 2));
+        present_waits_ = get_caps2 != nullptr && get_caps2(ctx_.physical, &info, &caps2) == VK_SUCCESS &&
+                         id2.presentId2Supported && wait2.presentWait2Supported;
     }
     present_family_ = compute_present_ ? ctx_.present_family : ctx_.queue_family;
     present_queue_handle_ = compute_present_ ? ctx_.present_queue : ctx_.queue;
-    std::fprintf(stderr, "ttt2: GPU: presenting from %s", compute_present_ ? "a compute queue" : "the rendering queue");
-    if (every_refresh_) {
-        std::fprintf(stderr, ", every refresh of a %.2f Hz display (%u per title frame)\n", hz, refreshes_per_frame_);
-    } else {
-        std::fprintf(stderr, " at times (a %.2f Hz display%s)\n", hz, waits ? "" : ", no present waits");
-    }
+    choose_presentation(host::window_refresh_rate());
     if (compute_present_) {
         shaderc_compile_options_t options = shaderc_compile_options_initialize();
         shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
@@ -189,10 +173,14 @@ uint32_t Renderer::take_present_image() {
     const bool fits = !present_images_.empty() && present_images_[0].width == scan.width &&
                       present_images_[0].height == scan.height && present_images_[0].format == format;
     if (!fits) {
-        // Wait until the presentation thread is done with the old images.
+        // Wait until the presentation thread has let go of the old images
+        // (presenting every refresh, it keeps showing one until told).
+        present_release_ = true;
+        present_cv_.notify_all();
         present_cv_.wait(lock, [&] {
             return present_queue_.empty() && std::all_of(present_free_.begin(), present_free_.end(), [](uint8_t f) { return f; });
         });
+        present_release_ = false;
         submit(true);
         for (Image& img : present_images_) destroy_image(img);
         present_images_.clear();
@@ -210,6 +198,7 @@ uint32_t Renderer::take_present_image() {
     if (!present_cv_.wait_for(lock, std::chrono::milliseconds(20), free) && !present_queue_.empty()) {
         const uint32_t i = present_queue_.front().image;
         present_queue_.pop_front();
+        stolen_images_.fetch_add(1, std::memory_order_relaxed);
         return i;
     }
     present_cv_.wait(lock, free);
@@ -254,7 +243,9 @@ void Renderer::queue_present(uint32_t image, double time, uint64_t ready) {
 // image, which is due a lead after the title vblank the frame started from.
 int64_t Renderer::frame_due() {
     frame_base_tick_ = tick_refresh_.load();
-    swap_delays_.push_back(static_cast<float>((now_seconds() - tick_time_.load()) * 1000.0));
+    if (const double tick_time = tick_time_.load(); tick_time != 0) {
+        swap_delays_.push_back(static_cast<float>((now_seconds() - tick_time) * 1000.0));
+    }
     return frame_base_tick_ + refresh_lead_.load();
 }
 
@@ -262,7 +253,7 @@ void Renderer::queue_frame_image(uint32_t image, uint64_t ready, uint32_t n) {
     QueuedFrame f{};
     f.image = image;
     f.ready = ready;
-    f.due = frame_base_due_ + int64_t{n} * (refreshes_per_frame_ / frames_per_frame_);
+    f.due = frame_base_due_ + int64_t{n} * (refreshes_per_frame_.load() / frames_per_frame_);
     f.tick = frame_base_tick_;
     f.first = n == 0;
     queue_present(f);
@@ -389,14 +380,50 @@ void Renderer::note_presentation(double scheduled, double presented) {
     window = presented;
 }
 
-void Renderer::presenter_main() {
-    pthread_setname_np(pthread_self(), "present");
-    if (every_refresh_) present_every_refresh();
-    else present_timed();
+// How to present on a display refreshing `hz` times a second: at every
+// refresh when the surface tells when presents reach the screen, the
+// display refreshes a whole number of times (two or more) per title frame
+// and the frame's images divide them evenly; else at times. (At 60 Hz
+// presenting every refresh would only add its queue's latency.)
+void Renderer::choose_presentation(double hz) {
+    const uint32_t per_frame = static_cast<uint32_t>(std::lround(hz / 60.0));
+    const bool every = present_waits_ && compute_present_ && per_frame >= 2 &&
+                       std::fabs(hz / 60.0 - per_frame) < 0.01 * per_frame && per_frame % frames_per_frame_ == 0 &&
+                       !std::getenv("TTT2_PRESENT_TIMED");
+    if (every) {
+        refreshes_per_frame_.store(per_frame);
+        refresh_period_ = 1.0 / hz;
+    }
+    every_refresh_.store(every);
+    static double printed_hz = 0;
+    static bool printed_every = false;
+    if (hz == printed_hz && every == printed_every) return;
+    printed_hz = hz;
+    printed_every = every;
+    std::fprintf(stderr, "ttt2: GPU: presenting from %s", compute_present_ ? "a compute queue" : "the rendering queue");
+    if (every) {
+        std::fprintf(stderr, ", every refresh of a %.2f Hz display (%u per title frame)\n", hz, per_frame);
+    } else {
+        std::fprintf(stderr, " at times (a %.2f Hz display%s)\n", hz, present_waits_ ? "" : ", no present waits");
+    }
 }
 
-void Renderer::present_timed() {
+void Renderer::presenter_main() {
+    pthread_setname_np(pthread_self(), "present");
+    // The mode follows the window's display: chosen again when the window
+    // moves to another display or its mode changes, or when the display
+    // turns out to refresh at another rate than reported.
     for (;;) {
+        const float reported = host::window_refresh_rate();
+        choose_presentation(measured_hz_ > 0 ? measured_hz_ : reported);
+        if (every_refresh_) present_every_refresh(reported);
+        else present_timed(reported);
+        if (host::window_refresh_rate() != reported) measured_hz_ = 0;
+    }
+}
+
+void Renderer::present_timed(float reported_hz) {
+    while (host::window_refresh_rate() == reported_hz) {
         QueuedFrame f;
         {
             std::unique_lock lock(present_mutex_);
@@ -441,6 +468,7 @@ void Renderer::present_timed() {
                 }
             }
         }
+        if (f.time == 0) f.time = now_seconds(); // queued while presenting every refresh: now
         const double wait = f.time - now_seconds();
         if (wait > 0) std::this_thread::sleep_for(std::chrono::duration<double>(std::min(wait, 0.1)));
         present_image(f.image, f.ready);
@@ -454,25 +482,48 @@ void Renderer::present_timed() {
 }
 
 // Presenting every refresh. FIFO presentation shows one image per refresh
-// and drops none; the thread keeps kQueued presents ahead of the screen
-// and, each time one reaches it (a present wait), queues the next: the
+// and drops none; the thread keeps a few presents ahead of the screen and,
+// each time the oldest reaches it (a present wait), queues the next: the
 // newest complete image due at the refresh it will show at, else the one
-// already showing again. Every refreshes_per_frame_-th refresh reaching the
-// screen is a title vblank; a frame's images are due a lead after the
-// vblank its frame started from, the lead being what frames have needed
-// (all but the slowest 1% over the last ten seconds, more at once when
-// frames keep coming late).
-void Renderer::present_every_refresh() {
-    static const size_t kQueued = [] {
-        const char* v = std::getenv("TTT2_PRESENT_QUEUE");
-        return v ? static_cast<size_t>(std::clamp(std::atoi(v), 1, 4)) : size_t{3};
-    }();
-    const int64_t per_frame = refreshes_per_frame_;
+// already showing again. Every refreshes_per_frame_-th refresh is a title
+// vblank; a frame's images are due a lead after the vblank its frame
+// started from, the lead being what frames have needed (all but the
+// slowest 1% over the last ten seconds, more at once when frames keep
+// coming late). Refreshes are counted one per present, and by time from
+// the last present the thread waited for (a refresh the screen showed
+// twice because a present came late); the time between such presents also
+// checks the display's rate. It returns when the mode should be chosen
+// again.
+void Renderer::present_every_refresh(float reported_hz) {
+    const int64_t per_frame = refreshes_per_frame_.load();
+    const double period = refresh_period_;
+    // Presents kept ahead: enough for about 8 ms, what KWin needs between a
+    // commit and the refresh that shows it plus how late it tells (3 at
+    // 240 Hz, 2 at 120 Hz).
+    static const char* queue_override = std::getenv("TTT2_PRESENT_QUEUE");
+    const size_t queued = queue_override ? static_cast<size_t>(std::clamp(std::atoi(queue_override), 1, 4))
+                                         : static_cast<size_t>(std::clamp(1 + std::ceil(0.008 / period), 2.0, 4.0));
+    const uint64_t stall_ns = static_cast<uint64_t>(std::max(0.025, (queued + 1) * period) * 1e9);
+    refresh_lead_.store(static_cast<int32_t>(per_frame + queued - 1));
+    {
+        // Images queued in the other mode: due at once.
+        std::lock_guard lock(present_mutex_);
+        for (QueuedFrame& f : present_queue_) {
+            f.due = INT64_MIN;
+            f.first = false;
+        }
+    }
     std::deque<uint64_t> in_flight; // presents not yet seen on screen
-    uint64_t next_id = 1, generation = swapchain_generation_;
-    int64_t refresh = 0;  // the refresh the last present seen on screen showed at
-    double seen_at = 0;   // when it was seen there
-    int64_t last_tick = -1;
+    uint64_t generation = swapchain_generation_;
+    int64_t& refresh = refresh_count_;
+    int64_t& last_tick = last_tick_;
+    int64_t anchor_refresh = 0;
+    double anchor_time = 0; // the last present waited for: its refresh and when it was seen (0: none)
+    uint32_t since_anchor = 0;
+    bool behind = false;     // the last present waited for came a refresh late: so far unconfirmed
+    bool unanchored = true;  // no count by time since the last title vblank
+    std::vector<double> periods; // one refresh, between presents waited for one after the other
+    uint32_t faster_windows = 0; // windows in a row measuring a faster display than reported
     uint32_t showing = UINT32_MAX; // the image presented last
     uint64_t showing_ready = 0;
     int64_t showing_from = 0;
@@ -480,76 +531,154 @@ void Renderer::present_every_refresh() {
     uint32_t refreshes = 0, images = 0, late = 0, missed = 0, dropped = 0, stalls = 0;
     uint32_t lengths[4] = {};
     double window = now_seconds();
-    std::vector<int32_t> needs;     // refreshes from a frame's vblank until its first image was complete
+    std::vector<int32_t> needs;      // refreshes from a frame's vblank until its first image was complete
     std::deque<int64_t> late_frames; // when frames needed more than the lead
     static const bool trace = std::getenv("TTT2_TRACE_PACING") != nullptr;
-    for (;;) {
-        // The first image (it sets the swapchain's format and size).
-        if (showing == UINT32_MAX) {
-            std::unique_lock lock(present_mutex_);
-            present_cv_.wait(lock, [&] { return !present_queue_.empty(); });
-            const QueuedFrame f = present_queue_.front();
+    // Shows the newest complete image at once (presents failing or not
+    // reaching the screen), so the queue keeps draining. Under present_mutex_.
+    const auto drain = [&] {
+        uint64_t done = 0;
+        VK_CHECK(vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done));
+        bool first = true;
+        while (!present_queue_.empty() && done >= present_queue_.front().ready) {
+            if (showing != UINT32_MAX) {
+                present_free_[showing] = 1;
+                if (first) {
+                    ++lengths[std::clamp<int64_t>(refresh + 1 - showing_from, 1, 4) - 1];
+                    ++images;
+                } else {
+                    ++dropped;
+                }
+            }
+            first = false;
+            showing = present_queue_.front().image;
+            showing_ready = present_queue_.front().ready;
+            showing_from = refresh + 1;
             present_queue_.pop_front();
-            lock.unlock();
-            VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-            wi.semaphoreCount = 1;
-            wi.pSemaphores = &timeline_;
-            wi.pValues = &f.ready;
-            VK_CHECK(vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull));
-            showing = f.image;
-            showing_ready = f.ready;
+        }
+        present_cv_.notify_all();
+    };
+    while (host::window_refresh_rate() == reported_hz) {
+        {
+            std::unique_lock lock(present_mutex_);
+            // The GPU thread replaces the images: let go of all of them.
+            const auto release = [&] {
+                if (showing != UINT32_MAX) present_free_[showing] = 1;
+                for (const QueuedFrame& f : present_queue_) present_free_[f.image] = 1;
+                present_queue_.clear();
+                showing = UINT32_MAX;
+                present_cv_.notify_all();
+            };
+            if (present_release_) release();
+            // The first image (it sets the swapchain's format and size).
+            if (showing == UINT32_MAX) {
+                for (;;) {
+                    present_cv_.wait(lock, [&] { return !present_queue_.empty(); });
+                    if (!present_release_) break;
+                    release();
+                }
+                const QueuedFrame f = present_queue_.front();
+                present_queue_.pop_front();
+                showing = f.image;
+                showing_ready = f.ready;
+                showing_from = refresh + 1;
+            }
         }
         if (generation != swapchain_generation_) { // presents to an old swapchain are gone
             generation = swapchain_generation_;
             in_flight.clear();
-            seen_at = 0;
+            anchor_time = 0;
+            unanchored = true;
         }
-        if (in_flight.size() >= kQueued) {
+        if (in_flight.size() >= queued) {
             VkPresentWait2InfoKHR wi{VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR};
             wi.presentId = in_flight.front();
-            wi.timeout = 100'000'000; // ns
-            const VkResult r = ctx_.wait_for_present(ctx_.device, swapchain_, &wi);
+            wi.timeout = 0;
+            VkResult r = ctx_.wait_for_present(ctx_.device, swapchain_, &wi);
+            const bool waited = r == VK_TIMEOUT; // else it was on screen already
+            if (waited) {
+                wi.timeout = stall_ns;
+                r = ctx_.wait_for_present(ctx_.device, swapchain_, &wi);
+            }
             if (r == VK_TIMEOUT) {
                 // Not reaching the screen (a hidden window): the title's own
-                // timer takes over its vblanks; keep only the newest image.
+                // timer takes over its vblanks; show the newest image.
                 ++stalls;
-                seen_at = 0;
+                anchor_time = 0;
+                unanchored = true;
                 std::lock_guard lock(present_mutex_);
-                uint64_t done = 0;
-                VK_CHECK(vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done));
-                while (!present_queue_.empty() && done >= present_queue_.front().ready) {
-                    present_free_[showing] = 1;
-                    showing = present_queue_.front().image;
-                    showing_ready = present_queue_.front().ready;
-                    present_queue_.pop_front();
-                }
-                present_cv_.notify_all();
+                drain();
                 continue;
             }
             in_flight.pop_front();
             if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
                 in_flight.clear();
-                seen_at = 0;
+                anchor_time = 0;
+                unanchored = true;
             } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
                 check_failed("vkWaitForPresent2KHR", r, __FILE__, __LINE__);
             } else {
-                // Refreshes since the last one seen: more than one means a
-                // present came too late for its refresh.
                 const double t = now_seconds();
-                const int64_t steps =
-                    seen_at == 0 ? 1 : std::max<int64_t>(1, std::llround((t - seen_at) / refresh_period_));
-                if (seen_at != 0) missed += static_cast<uint32_t>(steps - 1);
-                refresh += steps;
-                seen_at = t;
-                refreshes += static_cast<uint32_t>(steps);
+                int64_t shown = refresh + 1; // FIFO: one refresh per present
+                ++since_anchor;
+                bool reanchor = waited;
+                if (anchor_time != 0) {
+                    const double elapsed = (t - anchor_time) / period;
+                    if (waited) {
+                        // Refreshes the screen showed an image again (a present
+                        // too late for its refresh) are in the time; a single
+                        // late wake-up is too, so it counts once the next
+                        // present shows it as well (measured from the same
+                        // present: a repeat moves every later present).
+                        const int64_t by_time = anchor_refresh + static_cast<int64_t>(std::floor(elapsed + 0.3));
+                        if (by_time > shown && !behind) {
+                            behind = true;
+                            reanchor = false;
+                        } else if (by_time > shown) {
+                            missed += static_cast<uint32_t>(by_time - shown);
+                            shown = by_time;
+                            behind = false;
+                        } else {
+                            behind = false;
+                            // One refresh apart, waited for one after the other
+                            // with presents queued behind: the display's period.
+                            if (since_anchor == 1 && elapsed < 1.5) periods.push_back(t - anchor_time);
+                        }
+                    } else {
+                        // Already on screen: the thread fell behind and the
+                        // screen may have shown an image again meanwhile; at
+                        // least the refreshes since the anchor, less those the
+                        // presents still queued may take.
+                        const int64_t by_time = anchor_refresh + static_cast<int64_t>(std::floor(elapsed)) -
+                                                static_cast<int64_t>(in_flight.size());
+                        if (by_time > shown) {
+                            missed += static_cast<uint32_t>(by_time - shown);
+                            shown = by_time;
+                        }
+                    }
+                }
+                if (reanchor) {
+                    anchor_refresh = shown;
+                    anchor_time = t;
+                    since_anchor = 0;
+                }
+                refreshes += static_cast<uint32_t>(shown - refresh);
+                refresh = shown;
             }
         }
-        // The title's vblank, at every per_frame-th refresh.
+        // The title's vblanks, at every per_frame-th refresh (each one
+        // passed, up to a few after a stall).
         if (const int64_t tick = refresh / per_frame * per_frame; tick > last_tick) {
+            const int64_t passed = last_tick < 0 ? 1 : std::min<int64_t>((tick - last_tick) / per_frame, 4);
             last_tick = tick;
-            tick_time_.store(seen_at);
+            if (anchor_time != 0) tick_time_.store(now_seconds());
             tick_refresh_.store(tick);
-            gpu::host_vsync();
+            // Counted without time since the last vblank (after a stall, a
+            // new swapchain, a mode change): blanks the title's timer gave
+            // meanwhile are not in `passed`.
+            if (unanchored) gpu::forget_timer_vsyncs();
+            unanchored = anchor_time == 0;
+            gpu::host_vsync(static_cast<uint32_t>(passed));
         }
         // The refresh the next present shows at, and its image.
         const int64_t at = refresh + static_cast<int64_t>(in_flight.size()) + 1;
@@ -565,7 +694,7 @@ void Renderer::present_every_refresh() {
                     if (f.first) {
                         const int32_t need = static_cast<int32_t>(std::max<int64_t>(0, at - f.tick));
                         // Stalls (loading) over two frames are not measures.
-                        if (need <= 3 * per_frame + static_cast<int32_t>(kQueued)) {
+                        if (need <= 3 * per_frame + static_cast<int32_t>(queued)) {
                             needs.push_back(need);
                             // Late more than once in the last second: more lead
                             // now (a single late frame, such as one compiling a
@@ -583,7 +712,10 @@ void Renderer::present_every_refresh() {
                         }
                     }
                 }
-                if (f.due == at && !f.seen_ready) ++late;
+                if (f.due <= at && !f.seen_ready && !f.counted_late) {
+                    f.counted_late = true;
+                    ++late;
+                }
                 if (f.due <= at && f.seen_ready) chosen = static_cast<int32_t>(i);
             }
             if (chosen >= 0) {
@@ -603,12 +735,36 @@ void Renderer::present_every_refresh() {
                 present_cv_.notify_all();
             }
         }
-        if (present_image(showing, showing_ready, next_id)) {
-            in_flight.push_back(next_id++);
+        if (present_image(showing, showing_ready, present_id_ + 1)) {
+            in_flight.push_back(++present_id_);
         } else {
-            in_flight.clear(); // a new swapchain (or none, minimised)
-            seen_at = 0;
-            std::this_thread::sleep_for(std::chrono::duration<double>(refresh_period_));
+            // Not presented (a new swapchain, a minimised window): keep the
+            // queue moving.
+            in_flight.clear();
+            anchor_time = 0;
+            unanchored = true;
+            {
+                std::lock_guard lock(present_mutex_);
+                drain();
+            }
+            std::this_thread::sleep_for(std::chrono::duration<double>(period));
+        }
+
+        // The display's own rate, from presents waited for one after the
+        // other: faster than reported (a plausible rate, two windows in a
+        // row) chooses the mode again, else the title's vblanks would come
+        // too fast. (A slower display, or a compositor skipping refreshes,
+        // is counted by time.)
+        if (periods.size() >= 240) {
+            std::nth_element(periods.begin(), periods.begin() + periods.size() / 2, periods.end());
+            const double measured = periods[periods.size() / 2];
+            periods.clear();
+            faster_windows = measured > 1.0 / 500 && measured < 0.98 * period ? faster_windows + 1 : 0;
+            if (faster_windows >= 2) {
+                measured_hz_ = 1.0 / measured;
+                std::fprintf(stderr, "ttt2: GPU: the display refreshes at %.2f Hz, not %.2f\n", measured_hz_, 1.0 / period);
+                break;
+            }
         }
 
         const double now = now_seconds();
@@ -617,14 +773,15 @@ void Renderer::present_every_refresh() {
             // the slowest 1%.
             std::sort(needs.begin(), needs.end());
             if (needs.size() >= 100) refresh_lead_.store(std::max(needs[needs.size() * 99 / 100], 1));
+            const uint32_t stolen = stolen_images_.exchange(0, std::memory_order_relaxed);
             const uint32_t shown = std::max(1u, lengths[0] + lengths[1] + lengths[2] + lengths[3]);
             std::fprintf(stderr,
                          "ttt2: present: %.1f refreshes/s, %.1f images/s shown for 1/2/3/4+ refreshes: "
                          "%.1f/%.1f/%.1f/%.1f%%; %u late, %u missed refreshes, %u dropped%s; lead %d refreshes (%.1f ms)\n",
                          refreshes / (now - window), images / (now - window), 100.0 * lengths[0] / shown,
                          100.0 * lengths[1] / shown, 100.0 * lengths[2] / shown, 100.0 * lengths[3] / shown, late, missed,
-                         dropped, stalls ? ", stalled" : "", refresh_lead_.load(),
-                         refresh_lead_.load() * refresh_period_ * 1000.0);
+                         dropped + stolen, stalls ? ", stalled" : "", refresh_lead_.load(),
+                         refresh_lead_.load() * period * 1000.0);
             if (trace && !needs.empty()) {
                 const auto at_pct = [&](size_t p) { return needs[std::min(needs.size() - 1, needs.size() * p / 100)]; };
                 std::fprintf(stderr, "pacing: need 50%% %d, 90%% %d, 99%% %d, max %d refreshes\n", at_pct(50), at_pct(90),
@@ -636,6 +793,10 @@ void Renderer::present_every_refresh() {
             window = now;
         }
     }
+    // Leaving the mode: the image showing goes back; queued ones stay.
+    std::lock_guard lock(present_mutex_);
+    if (showing != UINT32_MAX) present_free_[showing] = 1;
+    present_cv_.notify_all();
 }
 
 void Renderer::create_swapchain(VkFormat image_format) {
@@ -666,7 +827,8 @@ void Renderer::create_swapchain(VkFormat image_format) {
     // Presenting every refresh: FIFO, one image per refresh. Else frames are
     // presented at chosen times: show each at the next refresh.
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    if (!every_refresh_) {
+    swapchain_every_refresh_ = every_refresh_.load();
+    if (!swapchain_every_refresh_) {
         for (VkPresentModeKHR m : modes) {
             if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
         }
@@ -686,10 +848,12 @@ void Renderer::create_swapchain(VkFormat image_format) {
     height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
 
     VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
-    if (every_refresh_) sci.flags = VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+    if (swapchain_every_refresh_) {
+        sci.flags = VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+    }
     sci.surface = surface_;
     // Every refresh: two queued, one on screen, one being written.
-    sci.minImageCount = std::max(caps.minImageCount, every_refresh_ ? 5u : 3u);
+    sci.minImageCount = std::max(caps.minImageCount, swapchain_every_refresh_ ? 5u : 3u);
     if (caps.maxImageCount) sci.minImageCount = std::min(sci.minImageCount, caps.maxImageCount);
     sci.imageFormat = chosen.format;
     sci.imageColorSpace = chosen.colorSpace;
@@ -752,7 +916,7 @@ bool Renderer::present_image(uint32_t i, uint64_t ready, uint64_t present_id) {
     const bool srgb_image = src.format == VK_FORMAT_R8G8B8A8_SRGB || src.format == VK_FORMAT_B8G8R8A8_SRGB;
     const bool srgb_chain = swapchain_format_ == VK_FORMAT_B8G8R8A8_SRGB || swapchain_format_ == VK_FORMAT_R8G8B8A8_SRGB;
     if (swapchain_ == VK_NULL_HANDLE || width != swapchain_extent_.width || height != swapchain_extent_.height ||
-        (!compute_present_ && srgb_image != srgb_chain)) {
+        (!compute_present_ && srgb_image != srgb_chain) || swapchain_every_refresh_ != every_refresh_.load()) {
         create_swapchain(src.format);
     }
     uint32_t index = 0;
@@ -868,7 +1032,7 @@ bool Renderer::present_image(uint32_t i, uint64_t ready, uint64_t present_id) {
     VK_CHECK(vkResetCommandPool(ctx_.device, present_pool_, 0));
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
         create_swapchain(src.format);
-        return r == VK_SUBOPTIMAL_KHR && present_id == 0;
+        return r == VK_SUBOPTIMAL_KHR; // (presented; an id on the old swapchain is gone with it)
     }
     if (r != VK_SUCCESS) check_failed("vkQueuePresentKHR", r, __FILE__, __LINE__);
     return true;

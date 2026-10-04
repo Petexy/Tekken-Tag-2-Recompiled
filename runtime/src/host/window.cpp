@@ -21,6 +21,24 @@ SDL_Window* g_window = nullptr;
 std::atomic<uint32_t> g_width{1280}, g_height{720};
 std::atomic<uint32_t> g_display_width{1280}, g_display_height{720};
 std::atomic<float> g_display_refresh{60.0f};
+std::atomic<float> g_window_refresh{60.0f};
+
+// A display's current refresh rate, as exactly as SDL knows it.
+float refresh_of(SDL_DisplayID display) {
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);
+    if (mode == nullptr) return 0.0f;
+    if (mode->refresh_rate_denominator) {
+        return static_cast<float>(double(mode->refresh_rate_numerator) / mode->refresh_rate_denominator);
+    }
+    return mode->refresh_rate;
+}
+
+// The window's display: it moves with the window (and its mode may change).
+void update_window_refresh() {
+    const SDL_DisplayID display = g_window ? SDL_GetDisplayForWindow(g_window) : 0;
+    const float hz = display ? refresh_of(display) : 0.0f;
+    if (hz > 0.0f) g_window_refresh = hz;
+}
 
 // Keyboard layout: arrows for the D-pad; X/Z/S/A for A/B/X/Y (the GamePad's
 // diamond); Q/W for L/R, 1/2 for ZL/ZR; Enter Plus, Backspace Minus, H Home;
@@ -112,11 +130,7 @@ bool open_window(const char* title) {
     if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay())) {
         g_display_width = static_cast<uint32_t>(mode->w * mode->pixel_density);
         g_display_height = static_cast<uint32_t>(mode->h * mode->pixel_density);
-        if (const SDL_DisplayMode* current = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay())) {
-            g_display_refresh = current->refresh_rate_denominator
-                                    ? static_cast<float>(double(current->refresh_rate_numerator) / current->refresh_rate_denominator)
-                                    : current->refresh_rate;
-        }
+        if (const float hz = refresh_of(SDL_GetPrimaryDisplay()); hz > 0.0f) g_display_refresh = g_window_refresh = hz;
         const int fit = std::max(1, std::min((mode->w - 64) / 640, (mode->h - 128) / 360));
         window_w = 640 * fit;
         window_h = 360 * fit;
@@ -131,6 +145,7 @@ bool open_window(const char* title) {
         return false;
     }
     update_size();
+    update_window_refresh();
     return true;
 }
 
@@ -146,6 +161,8 @@ bool run_event_loop(const std::function<bool()>& finished) {
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED: return false;
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
             case SDL_EVENT_WINDOW_RESIZED: update_size(); break;
+            case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED: update_window_refresh(); break;
             case SDL_EVENT_KEY_DOWN:
                 if (event.key.scancode == SDL_SCANCODE_F11) {
                     const bool full = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0;
@@ -177,6 +194,15 @@ VkSurfaceKHR create_vulkan_surface(VkInstance instance) {
 }
 
 float display_refresh_rate() { return g_display_refresh; }
+float window_refresh_rate() {
+    // TTT2_DISPLAY_HZ: report another rate (testing how presentation copes
+    // with a display that refreshes otherwise than reported).
+    static const float assumed = [] {
+        const char* v = std::getenv("TTT2_DISPLAY_HZ");
+        return v ? static_cast<float>(std::atof(v)) : 0.0f;
+    }();
+    return assumed > 0.0f ? assumed : g_window_refresh.load();
+}
 
 void display_size(uint32_t& width, uint32_t& height) {
     width = g_display_width;

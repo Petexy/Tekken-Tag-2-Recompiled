@@ -50,11 +50,16 @@ void note_swap_requested();
 void frame_ready();
 void wait_for_vsync();
 void wait_for_flip();
-// A vertical blank from the host display (the presentation thread, when the
+// Vertical blanks from the host display (the presentation thread, when the
 // display refreshes at a multiple of 60 Hz): the title's frames then keep
-// step with the display's refreshes. The display's own 59.94 Hz timer
-// stands in whenever these stop for a few frames.
-void host_vsync();
+// step with the display's refreshes. `count` blanks passed since the last
+// call (more than one after a stall). The display's own 59.94 Hz timer
+// stands in whenever these stop for two frames; blanks it gave meanwhile
+// count against the following calls' (up to four).
+void host_vsync(uint32_t count = 1);
+// The host's blanks restart without reporting the time they were missing
+// (counted anew): the timer's blanks meanwhile stand.
+void forget_timer_vsyncs();
 void set_swap_interval(uint32_t interval);
 uint32_t swap_interval();
 

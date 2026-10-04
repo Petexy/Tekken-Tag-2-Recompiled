@@ -157,8 +157,9 @@ void Renderer::init_interpolation() {
     if (const char* v = std::getenv("TTT2_FPS")) {
         fps = static_cast<uint32_t>(std::atoi(v));
     } else {
-        // Smoother than the title's 60 only on displays that refresh faster.
-        fps = host::display_refresh_rate() >= 100.0f ? 120 : 60;
+        // Smoother than the title's 60 only on displays that refresh faster
+        // (the window's, or the primary one it is likely moved to).
+        fps = std::max(host::display_refresh_rate(), host::window_refresh_rate()) >= 100.0f ? 120 : 60;
     }
     frames_per_frame_ = std::clamp((fps + 30) / 60, 1u, 4u);
     if (frames_per_frame_ > 1) {
@@ -401,7 +402,9 @@ void Renderer::begin_replay(uint32_t n) {
     }
     std::vector<uint32_t> place(cur.draws.size(), 0); // among this frame's draws with its key
     std::vector<Group*> group_of(cur.draws.size(), nullptr);
-    uint32_t matched = 0, rejected = 0;
+    // Counted over the draws that blend (the 3D scene): flat ones never do.
+    uint32_t scene = 0, matched = 0, rejected = 0;
+    for (const DrawRecord& d : cur.draws) scene += d.blend;
     for (uint32_t i = 0; i < cur.draws.size(); ++i) {
         const auto it = groups.find(cur.draws[i].key);
         if (it == groups.end()) continue;
@@ -416,12 +419,12 @@ void Renderer::begin_replay(uint32_t n) {
         same->second.pop_front();
         g.paired[k] = 1;
         match_[i] = static_cast<int32_t>(g.prev[k]);
-        ++matched;
+        matched += cur.draws[i].blend;
     }
     constexpr uint32_t kWindow = 16; // places searched either side
     for (uint32_t i = 0; i < cur.draws.size(); ++i) {
         Group* g = group_of[i];
-        if (g == nullptr || match_[i] >= 0) continue;
+        if (g == nullptr || match_[i] >= 0 || !cur.draws[i].blend) continue;
         const uint32_t from = place[i] > kWindow ? place[i] - kWindow : 0;
         const uint32_t to = std::min<uint32_t>(static_cast<uint32_t>(g->prev.size()), place[i] + kWindow + 1);
         int32_t best = -1;
@@ -449,15 +452,15 @@ void Renderer::begin_replay(uint32_t n) {
         match_[i] = static_cast<int32_t>(g->prev[best]);
     }
     static const bool test = std::getenv("TTT2_INTERP_TEST") != nullptr; // replay without blending
-    replay_blend_ = !test && !cur.overflow && !prev.overflow && !cur.draws.empty() &&
-                    matched * 10 >= cur.draws.size() * 8 && rejected * 4 <= matched;
+    replay_blend_ = !test && !cur.overflow && !prev.overflow && scene > 0 && matched * 10 >= scene * 8 &&
+                    rejected * 4 <= matched;
     ++replays_;
     if (replay_blend_) ++blended_replays_;
     match_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     static const bool trace = std::getenv("TTT2_TRACE_INTERP") != nullptr;
     if (trace && replays_ % 120 == 1) {
-        std::fprintf(stderr, "interp: %zu draws, %zu in the previous frame, %u matched, %u too different%s%s\n",
-                     cur.draws.size(), prev.draws.size(), matched, rejected, cur.overflow ? ", overflow" : "",
+        std::fprintf(stderr, "interp: %zu draws (%u 3D), %zu in the previous frame, %u 3D matched, %u too different%s%s\n",
+                     cur.draws.size(), scene, prev.draws.size(), matched, rejected, cur.overflow ? ", overflow" : "",
                      replay_blend_ ? ", blending" : "");
     }
 }

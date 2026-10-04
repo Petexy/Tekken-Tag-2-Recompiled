@@ -7,6 +7,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <map>
+#include <string_view>
 #include <vector>
 
 namespace cafe::latte {
@@ -70,14 +71,28 @@ private:
     void note_gpr(uint32_t gpr, bool rel) {
         if (rel) relative_ = true;
         max_gpr_ = std::max<int>(max_gpr_, static_cast<int>(gpr));
+        if (gpr < kClauseTemps) max_register_ = std::max<int>(max_register_, static_cast<int>(gpr));
     }
     void analyze(const Program& program);
 
     // ------------------------------------------------------- registers
+    // A register read. Relative ones go through rel_load, which reads the
+    // register file at constant indices only: indexing the array itself
+    // would make the driver keep all of it in (slow) memory instead of
+    // registers, 16 ms for one full-screen blur at 1440p.
     std::string gpr(uint32_t index, bool rel, uint32_t index_mode) const {
         if (!rel) return format("R[%u]", index);
-        return format("R[clamp(%u + %s, 0, %d)]", index, index_register(index_mode).c_str(), gpr_count_ - 1);
+        return format("rel_load(%u + %s)", index, index_register(index_mode).c_str());
     }
+    // A register write of one channel.
+    std::string gpr_store(uint32_t index, bool rel, uint32_t index_mode, char chan, const std::string& value) const {
+        if (!rel) return format("R[%u].%c = %s;", index, chan, value.c_str());
+        return format("rel_store(%u + %s, %d, %s);", index, index_register(index_mode).c_str(),
+                      static_cast<int>(std::string_view("xyzw").find(chan)), value.c_str());
+    }
+    // TEX/VTX/export relative registers add the loop index aL (ALU
+    // operands choose with their INDEX_MODE).
+    static constexpr uint32_t kLoopIndex = 4;
     std::string index_register(uint32_t index_mode) const {
         if (index_mode < 4) return format("AR.%c", kChan[index_mode]);
         return "AL";
@@ -127,7 +142,10 @@ private:
     int indent_ = 1;
     std::string error_;
 
+    // Registers 123-127 are the clause temporaries (T0-T4), never relative.
+    static constexpr uint32_t kClauseTemps = 123;
     int max_gpr_ = 0;
+    int max_register_ = 0; // highest below the clause temporaries
     int gpr_count_ = 1;
     bool relative_ = false;
     bool uses_kill_ = false;
@@ -501,8 +519,7 @@ void Translator::emit_group(const AluGroup& group, const CfInstruction& cf) {
     for (const AluInstruction& in : group.instructions) {
         if (!has[in.slot] || !in.write) continue;
         const char name = in.slot < 4 ? kChan[in.slot] : 't';
-        std::string write = format("%s.%c = t%c;", gpr(in.dst_gpr, in.dst_rel, in.index_mode).c_str(),
-                                   kChan[in.dst_chan], name);
+        std::string write = gpr_store(in.dst_gpr, in.dst_rel, in.index_mode, kChan[in.dst_chan], format("t%c", name));
         if (in.pred_sel == alu::kPredZero) write = "if (!pred) " + write;
         if (in.pred_sel == alu::kPredOne) write = "if (pred) " + write;
         line(write);
@@ -647,7 +664,7 @@ void Translator::emit_vertex_fetch(const VtxInstruction& v) {
         }
         index = "(" + index + " + dc.vtx.y)";
     } else {
-        index = format("uint(%s.%c)", gpr(v.src_gpr, v.src_rel, 0).c_str(), kChan[v.src_sel_x & 3]);
+        index = format("uint(%s.%c)", gpr(v.src_gpr, v.src_rel, kLoopIndex).c_str(), kChan[v.src_sel_x & 3]);
         if (v.fetch_type != vtx::kNoIndexOffset) index = "(" + index + " + dc.vtx.x)";
     }
     open("");
@@ -659,7 +676,7 @@ void Translator::emit_vertex_fetch(const VtxInstruction& v) {
         const uint8_t sel = v.dst_sel[i];
         if (sel == kSelMask) continue;
         const std::string value = sel < 4 ? format("f.%c", kChan[sel]) : sel == kSel1 ? std::string(one) : "0";
-        line(format("%s.%c = %s;", gpr(dst, v.dst_rel, 0).c_str(), kChan[i], value.c_str()));
+        line(gpr_store(dst, v.dst_rel, kLoopIndex, kChan[i], value));
     }
     close();
 }
@@ -670,7 +687,7 @@ void Translator::emit_buffer_fetch(const TexInstruction& t) {
     const char* stage = vs_ ? "vs" : "ps";
     const std::string b = (slot >= 0 && slot < 16) ? format("dc.%s_buf[%d]", stage, slot) : "uvec4(0)";
     if (slot >= 0 && slot < 16) buffer_mask_ |= 1u << slot;
-    const std::string index = format("uint(%s.%c)", gpr(v.src_gpr, v.src_rel, 0).c_str(), kChan[v.src_sel_x & 3]);
+    const std::string index = format("uint(%s.%c)", gpr(v.src_gpr, v.src_rel, kLoopIndex).c_str(), kChan[v.src_sel_x & 3]);
     // Uniform blocks GX2 binds as buffers hold raw 32-bit words (32_32_32_32).
     const uint32_t data_format = v.use_const_fields ? 0x22 : v.data_format;
     open("");
@@ -683,7 +700,7 @@ void Translator::emit_buffer_fetch(const TexInstruction& t) {
         const uint8_t sel = v.dst_sel[i];
         if (sel == kSelMask) continue;
         const std::string value = sel < 4 ? format("f.%c", kChan[sel]) : sel == kSel1 ? "0x3F800000" : "0";
-        line(format("%s.%c = %s;", gpr(dst, v.dst_rel, 0).c_str(), kChan[i], value.c_str()));
+        line(gpr_store(dst, v.dst_rel, kLoopIndex, kChan[i], value));
     }
     close();
 }
@@ -692,7 +709,7 @@ void Translator::emit_buffer_fetch(const TexInstruction& t) {
 
 std::string Translator::tex_coord(const TexInstruction& t, int i) const {
     const uint8_t sel = t.src_sel[i];
-    if (sel < 4) return format("intBitsToFloat(%s.%c)", gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[sel]);
+    if (sel < 4) return format("intBitsToFloat(%s.%c)", gpr(t.src_gpr, t.src_rel, kLoopIndex).c_str(), kChan[sel]);
     return sel == kSel1 ? "1.0" : "0.0";
 }
 
@@ -705,7 +722,7 @@ void Translator::emit_texture(const TexInstruction& t) {
     }
     const ShaderEnvironment::Texture& tx = env_.textures[slot];
     const std::string sampler = format("tex%u", slot);
-    const std::string dst = gpr(t.dst_gpr, t.dst_rel, 0);
+    const auto store = [&](int i, const std::string& value) { line(gpr_store(t.dst_gpr, t.dst_rel, kLoopIndex, kChan[i], value)); };
     const bool integer = tx.kind != TextureKind::kFloat;
     switch (t.inst) {
     case kSetGradientsH:
@@ -723,7 +740,7 @@ void Translator::emit_texture(const TexInstruction& t) {
             const uint8_t sel = t.dst_sel[i];
             if (sel == kSelMask) continue;
             const std::string v = sel < 4 ? format("floatBitsToInt(r.%c)", kChan[sel]) : sel == kSel1 ? "0x3F800000" : "0";
-            line(format("%s.%c = %s;", dst.c_str(), kChan[i], v.c_str()));
+            store(i, v);
         }
         close();
         return;
@@ -889,25 +906,27 @@ void Translator::emit_texture(const TexInstruction& t) {
         // Texel coordinates scale with the texture; an array layer does not.
         for (int i = 0; i < coords; ++i) {
             const bool texel = i < spatial;
-            args += (i ? ", " : "") + format(texel ? "%s.%c * int(tex_scale(%uu))" : "%s.%c", gpr(t.src_gpr, t.src_rel, 0).c_str(),
+            args += (i ? ", " : "") + format(texel ? "%s.%c * int(tex_scale(%uu))" : "%s.%c", gpr(t.src_gpr, t.src_rel, kLoopIndex).c_str(),
                                             kChan[t.src_sel[i] & 3], slot);
         }
-        if (coords == 1) call = format("texelFetch(%s, %s.%c * int(tex_scale(%uu)), %s.%c)", sampler.c_str(), gpr(t.src_gpr, t.src_rel, 0).c_str(),
-                                       kChan[t.src_sel[0] & 3], slot, gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[t.src_sel[3] & 3]);
-        else call = format("texelFetch(%s, %s%s), %s.%c)", sampler.c_str(), ic.c_str(), args.c_str(), gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[t.src_sel[3] & 3]);
+        if (coords == 1) call = format("texelFetch(%s, %s.%c * int(tex_scale(%uu)), %s.%c)", sampler.c_str(), gpr(t.src_gpr, t.src_rel, kLoopIndex).c_str(),
+                                       kChan[t.src_sel[0] & 3], slot, gpr(t.src_gpr, t.src_rel, kLoopIndex).c_str(), kChan[t.src_sel[3] & 3]);
+        else call = format("texelFetch(%s, %s%s), %s.%c)", sampler.c_str(), ic.c_str(), args.c_str(), gpr(t.src_gpr, t.src_rel, kLoopIndex).c_str(), kChan[t.src_sel[3] & 3]);
         break;
     }
     case kGetTextureInfo: {
-        const std::string lod = format("%s.%c", gpr(t.src_gpr, t.src_rel, 0).c_str(), kChan[t.src_sel[0] & 3]);
+        const std::string lod = format("%s.%c", gpr(t.src_gpr, t.src_rel, kLoopIndex).c_str(), kChan[t.src_sel[0] & 3]);
         const std::string ts = format("int(tex_scale(%uu))", slot);
         if (coords == 1) call = format("ivec4(textureSize(%s, %s) / %s, 0, 0, textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), ts.c_str(), sampler.c_str());
         else if (coords == 2) call = format("ivec4(textureSize(%s, %s) / %s, 0, textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), ts.c_str(), sampler.c_str());
         else if (array) call = format("ivec4(textureSize(%s, %s) / ivec3(%s, %s, 1), textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), ts.c_str(), ts.c_str(), sampler.c_str());
         else call = format("ivec4(textureSize(%s, %s) / %s, textureQueryLevels(%s))", sampler.c_str(), lod.c_str(), ts.c_str(), sampler.c_str());
+        // Queried once: the destination may be the LOD's register.
+        line("ivec4 q = " + call + ";");
         for (int i = 0; i < 4; ++i) {
             const uint8_t sel = t.dst_sel[i];
             if (sel == kSelMask) continue;
-            line(format("%s.%c = %s;", dst.c_str(), kChan[i], sel < 4 ? format("(%s).%c", call.c_str(), kChan[sel]).c_str() : sel == kSel1 ? "1" : "0"));
+            store(i, sel < 4 ? format("q.%c", kChan[sel]) : sel == kSel1 ? "1" : "0");
         }
         close();
         return;
@@ -924,7 +943,7 @@ void Translator::emit_texture(const TexInstruction& t) {
         const uint8_t sel = t.dst_sel[i];
         if (sel == kSelMask) continue;
         const std::string v = sel < 4 ? format("r.%c", kChan[sel]) : sel == kSel1 ? std::string(one) : "0";
-        line(format("%s.%c = %s;", dst.c_str(), kChan[i], v.c_str()));
+        store(i, v);
     }
     close();
 }
@@ -946,7 +965,7 @@ void Translator::emit_export(const CfInstruction& cf) {
     const ExportInstruction& e = cf.exp;
     const auto component = [&](int burst, int i, bool as_float) -> std::string {
         const uint8_t sel = e.sel[i];
-        const std::string reg = gpr(e.rw_gpr + burst, e.rw_rel, 0);
+        const std::string reg = gpr(e.rw_gpr + burst, e.rw_rel, kLoopIndex);
         if (sel < 4) return as_float ? format("intBitsToFloat(%s.%c)", reg.c_str(), kChan[sel]) : format("%s.%c", reg.c_str(), kChan[sel]);
         if (sel == kSel1) return as_float ? "1.0" : "1";
         return as_float ? "0.0" : "0";
@@ -1033,7 +1052,7 @@ void Translator::emit_stream_out(const CfInstruction& cf) {
     if (!(env_.stream_out_mask & (1u << buffer))) return; // buffer not enabled: no write
     if (e.type != 0) fail("indexed stream-out write");
     const uint32_t stride = env_.stream_out_stride[buffer];
-    const std::string reg = gpr(e.rw_gpr, e.rw_rel, 0);
+    const std::string reg = gpr(e.rw_gpr, e.rw_rel, kLoopIndex);
     for (int i = 0; i < 4; ++i) {
         if (!(e.comp_mask & (1u << i))) continue;
         line(format("gstore(dc.so[%u], uint(gl_VertexIndex) * %uu + %uu, uint(%s.%c));", buffer, stride,
@@ -1439,8 +1458,25 @@ bool Translator::run(std::string& error) {
                                  "ivec4 AR = ivec4(0);\nivec4 ARn = ivec4(0);\nint AL = 0;\n",
                                  gpr_count_);
     if (uses_gradients_) globals += "vec4 gradH = vec4(0.0);\nvec4 gradV = vec4(0.0);\n";
-    out_.glsl = header() + globals + "\n" + functions + "void main() {\n" +
-                format("    for (int i = 0; i < %d; ++i) R[i] = ivec4(0);\n", gpr_count_) + main_vars + main_body + "}\n";
+    std::string init = format("    for (int i = 0; i < %d; ++i) R[i] = ivec4(0);\n", gpr_count_);
+    if (relative_) {
+        // Relative addressing ranges over the program's registers; every
+        // access to the register file has a constant index (see gpr()).
+        const int count = std::clamp(std::max<int>(env_.num_gprs, max_register_ + 1), 1, static_cast<int>(kClauseTemps));
+        std::string load = "ivec4 rel_load(int i) {\n    switch (clamp(i, 0, " + std::to_string(count - 1) + ")) {\n";
+        std::string store = "void rel_store(int i, int c, int v) {\n    switch (clamp(i, 0, " + std::to_string(count - 1) + ")) {\n";
+        init.clear();
+        for (int k = 0; k < count; ++k) {
+            load += format("    case %d: return R[%d];\n", k, k);
+            store += format("    case %d: R[%d][c] = v; break;\n", k, k);
+            init += format("    R[%d] = ivec4(0);\n", k);
+        }
+        for (int k = kClauseTemps; k < gpr_count_; ++k) init += format("    R[%d] = ivec4(0);\n", k);
+        load += "    }\n    return ivec4(0);\n}\n";
+        store += "    }\n}\n";
+        globals += load + store;
+    }
+    out_.glsl = header() + globals + "\n" + functions + "void main() {\n" + init + main_vars + main_body + "}\n";
     if (!error_.empty()) {
         error = error_;
         return false;
