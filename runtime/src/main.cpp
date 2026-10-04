@@ -7,6 +7,7 @@
 
 #include "host/audio.h"
 #include "host/window.h"
+#include "install.h"
 
 #include <atomic>
 #include <cstdio>
@@ -26,11 +27,17 @@ namespace {
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "usage: %s GAME\n"
-                 "  GAME is the title's .wua archive, or a directory with code/,\n"
-                 "  content/ and meta/. Saves go to $TTT2_SAVE_DIR, default\n"
+                 "usage: %s [GAME]\n"
+                 "       %s --install [GAME [FOLDER]] [--no-launcher]\n"
+                 "       %s --update [FOLDER]\n"
+                 "  GAME is the title's .wua archive, or a folder with code/,\n"
+                 "  content/ and meta/; without it the installed game runs.\n"
+                 "  --install copies the game, this executable and its icon into\n"
+                 "  FOLDER (chosen in a dialog when not given) and adds it to the\n"
+                 "  application menu; --update copies this executable into the\n"
+                 "  install after a rebuild. Saves go to $TTT2_SAVE_DIR, default\n"
                  "  ~/.local/share/ttt2/save.\n",
-                 argv0);
+                 argv0, argv0, argv0);
 }
 
 // Objects the game imports as data are created by the library that owns
@@ -58,12 +65,24 @@ uint32_t guest_strdup(const char* text) {
 
 int main(int argc, char** argv) {
     using namespace cafe;
-    if (argc != 2) {
+    if (argc >= 2 && (std::strcmp(argv[1], "--install") == 0 || std::strcmp(argv[1], "--update") == 0)) {
+        return install::run(std::vector<std::string>(argv + 1, argv + argc));
+    }
+    if (argc >= 2 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0)) {
+        usage(argv[0]);
+        return 0;
+    }
+    std::filesystem::path game;
+    if (argc == 2) {
+        game = argv[1];
+    } else if (const auto installed = install::installed_game(); argc == 1 && installed) {
+        game = *installed;
+    } else {
         usage(argv[0]);
         return 2;
     }
     install_fault_handler();
-    vfs::open_game(argv[1]);
+    vfs::open_game(game);
     if (const char* save = std::getenv("TTT2_SAVE_DIR")) {
         vfs::set_save_root(save);
     } else {
@@ -93,6 +112,13 @@ int main(int argc, char** argv) {
     // runs beside it. TTT2_GPU=null runs headless.
     const char* gpu = std::getenv("TTT2_GPU");
     const bool headless = (gpu && std::strcmp(gpu, "null") == 0) || !host::open_window("Tekken Tag Tournament 2");
+    if (!headless) {
+        std::vector<uint8_t> icon;
+        uint32_t width = 0, height = 0;
+        if (const auto tga = vfs::read_whole("/vol/meta/iconTex.tga"); tga && install::decode_tga(*tga, icon, width, height)) {
+            host::set_window_icon(icon, width, height);
+        }
+    }
     host::open_audio();
     if (headless) return run();
     std::atomic<bool> finished{false};

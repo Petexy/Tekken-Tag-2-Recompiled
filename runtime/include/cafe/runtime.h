@@ -35,6 +35,8 @@ struct LoadedImage {
 // Loads the RPX the code was generated from into guest memory, applying
 // relocations exactly as the recompiler did. Refuses any other build.
 LoadedImage load_image(const std::vector<uint8_t>& rpx_bytes);
+// SHA-256 as lowercase hex (cafe_program_info.rpx_sha256 names the RPX).
+std::string sha256_hex(const std::vector<uint8_t>& data);
 
 // ---------------------------------------------------------------- dispatch
 void build_dispatch_table();

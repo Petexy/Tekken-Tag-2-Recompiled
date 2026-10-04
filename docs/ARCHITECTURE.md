@@ -332,7 +332,28 @@ executable and all assets from the archive in place (a directory with
 code/, content/, meta/ also works). Reading through the archive costs
 nothing measurable in play (`TTT2_TRACE_FS=1`): a fight reads ~0.5 MB of
 music per 10 s (0.3 ms), loading a stage ~95 MB (0.5 s from a hard disk,
-mostly seeks). Saves go to `$TTT2_SAVE_DIR`, default
+mostly seeks).
+
+`ttt2 --install [GAME [FOLDER]] [--no-launcher]` (`install.cpp`) installs
+the port like other programs: the game's `.wua` and the install folder
+come from the desktop's file dialogs (SDL3, the XDG desktop portal; they
+may open behind the active window, see the taskbar), from a terminal
+prompt when there are none, or from the arguments. A chosen folder that
+is empty, new or an earlier install is the install folder; any other gets
+a "Tekken Tag Tournament 2" folder inside. The game is checked against
+the RPX hash the port was generated from before anything is copied, and
+against the free space. The install folder gets `game/` (code/,
+content/, meta/; 15.9 GB, ~4 minutes from a hard disk), the executable,
+`icon.png` (meta/iconTex.tga) and `.ttt2-install`, written last;
+`$XDG_CONFIG_HOME/ttt2/installed` names the folder, and
+`$XDG_DATA_HOME/applications/ttt2.desktop` puts it in the application menu
+(the window's Wayland app id is `ttt2`, so it gets that entry's icon). Files
+are copied through `<name>.part` and renamed when complete, so an
+interrupted install resumes; files already there are kept, so a file
+replaced for a mod survives installing again (deleting one restores it).
+`ttt2` without arguments runs the game next to the executable or, failing
+that, the recorded install; `ttt2 --update [FOLDER]` copies a rebuilt
+executable into the install. Saves go to `$TTT2_SAVE_DIR`, default
 `~/.local/share/ttt2/save`. The OS layer is in `runtime/src/os/`; each OS
 function is plain C++ registered with `CAFE_EXPORT(module, name, fn)`, and
 anything not implemented stops with the function's name and a guest

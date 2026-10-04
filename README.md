@@ -177,6 +177,20 @@ cmake --build build-port --target ttt2 -j 8
 build-port/ttt2 "/path/to/TEKKEN TAG 2 Wii U EDITION (EU).wua"
 ```
 
+To install it like any other program, run the built executable with
+`--install`. It asks for the game's `.wua` and for the folder to install
+into (the desktop's file dialogs; a terminal prompt without them), checks
+that the game is the one the port was made from, copies the game (16 GB),
+the executable and the game's icon there and adds "Tekken Tag Tournament 2"
+to the application menu. The installed `ttt2` then starts without
+arguments, and the `.wua` is no longer needed:
+
+```bash
+build-port/ttt2 --install                      # choose the .wua and the folder
+build-port/ttt2 --install GAME.wua FOLDER      # or give them
+build-port/ttt2 --update                       # after a rebuild: the new executable into the install
+```
+
 The renderer needs Vulkan 1.3 with VK_EXT_external_memory_host and push
 descriptors (any current AMD, NVIDIA or Intel driver on Linux), SDL3 and
 shaderc. Controls and debugging variables are listed in

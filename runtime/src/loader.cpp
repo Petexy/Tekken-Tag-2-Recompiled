@@ -11,9 +11,8 @@
 #include <vector>
 
 namespace cafe {
-namespace {
 
-std::string sha256_of(const std::vector<uint8_t>& data) {
+std::string sha256_hex(const std::vector<uint8_t>& data) {
     unsigned char digest[32];
     unsigned int length = 0;
     EVP_Digest(data.data(), data.size(), digest, &length, EVP_sha256(), nullptr);
@@ -26,10 +25,8 @@ std::string sha256_of(const std::vector<uint8_t>& data) {
     return hex;
 }
 
-} // namespace
-
 LoadedImage load_image(const std::vector<uint8_t>& rpx_bytes) {
-    const std::string digest = sha256_of(rpx_bytes);
+    const std::string digest = sha256_hex(rpx_bytes);
     if (digest != cafe_program_info.rpx_sha256) {
         fatal("this Tekken.rpx is not the executable the port was generated from\n"
               "  expected sha256 %s\n  found           %s",

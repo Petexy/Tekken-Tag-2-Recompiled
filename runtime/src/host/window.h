@@ -16,6 +16,8 @@ namespace cafe::host {
 // headless). Main thread only.
 bool open_window(const char* title);
 bool window_open();
+// The window's icon, RGBA rows top first. Main thread only.
+void set_window_icon(const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height);
 
 // Runs the event loop until `finished` returns true or the window closes.
 // Returns false if the user closed the window.

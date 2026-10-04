@@ -74,8 +74,8 @@ bool write_png(const std::string& path, const uint8_t* rgba, uint32_t width, uin
     put32(z, (b << 16) | a);
     chunk(f, "IDAT", z);
     chunk(f, "IEND", {});
-    std::fclose(f);
-    return true;
+    const bool written = !std::ferror(f);
+    return std::fclose(f) == 0 && written;
 }
 
 } // namespace cafe::gpu::vk

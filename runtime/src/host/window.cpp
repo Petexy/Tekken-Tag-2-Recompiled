@@ -120,6 +120,8 @@ void update_size() {
 } // namespace
 
 bool open_window(const char* title) {
+    // The identifier is the Wayland app id: ttt2.desktop's (ttt2 --install).
+    SDL_SetAppMetadata(title, nullptr, "ttt2");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "ttt2: no window: %s\n", SDL_GetError());
         return false;
@@ -150,6 +152,15 @@ bool open_window(const char* title) {
 }
 
 bool window_open() { return g_window != nullptr; }
+
+void set_window_icon(const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height) {
+    if (g_window == nullptr || rgba.size() < size_t{width} * height * 4) return;
+    SDL_Surface* icon = SDL_CreateSurfaceFrom(static_cast<int>(width), static_cast<int>(height), SDL_PIXELFORMAT_RGBA32,
+                                              const_cast<uint8_t*>(rgba.data()), static_cast<int>(width * 4));
+    if (icon == nullptr) return;
+    SDL_SetWindowIcon(g_window, icon);
+    SDL_DestroySurface(icon);
+}
 
 bool run_event_loop(const std::function<bool()>& finished) {
     using namespace std::chrono_literals;
