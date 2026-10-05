@@ -27,7 +27,8 @@ namespace {
 int32_t g_main_core = -1;
 
 // Register ranges ([dword offset, count] within each space) that a context
-// switch restores; the same ranges the console's GX2 uses.
+// switch restores; the same ranges the console's GX2 uses (as decaf-emu's
+// reverse engineering of GX2 documents them).
 constexpr std::pair<uint32_t, uint32_t> kConfigRanges[] = {
     {0x300, 6}, {0x900, 0x48}, {0x980, 0x48}, {0xA00, 0x48}, {0x310, 0xC}, {0x542, 1}, {0x235, 1}, {0x232, 2},
     {0x23A, 1}, {0x256, 1},    {0x60C, 1},    {0x5C5, 1},    {0x2C8, 1},   {0x363, 1}, {0x404, 2},
@@ -83,7 +84,8 @@ void disable_state_shadowing() {
 }
 
 // The registers GX2 programs once at initialisation and for every new
-// context state, before the default state.
+// context state, before the default state (the console's values, as
+// documented by decaf-emu).
 void init_registers() {
     const uint32_t zeroes[24] = {};
     const uint32_t screen_scissor[] = {0, field(8192, 0, 14) | field(8192, 16, 14)};

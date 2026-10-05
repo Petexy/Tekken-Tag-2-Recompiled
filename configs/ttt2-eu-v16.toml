@@ -1,8 +1,0 @@
-project_name = "Tekken Tag Tournament 2 EU v16"
-target_prefix = "ttt2"
-
-[target]
-title_id = "000500001010f800"
-title_version = 16
-sha256 = "fc0270465d384386f67804e48716e30bfbe85a5a1004e3a6bfe3ac75f9de5019"
-entry_point = 0x8966b7c

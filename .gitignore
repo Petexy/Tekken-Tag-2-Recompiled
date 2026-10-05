@@ -5,3 +5,15 @@
 /generated/
 __pycache__/
 *.pyc
+
+# The game and anything taken or generated from it stay out of the repository.
+*.wua
+*.wud
+*.wux
+*.rpx
+*.rpl
+*.rpx.*
+*.btsnd
+*.bfma
+*.h264
+/captures/

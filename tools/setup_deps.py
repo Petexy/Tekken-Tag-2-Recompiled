@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch pinned sources and apply the project's recorded recompiler patches."""
+"""Fetch the pinned sources the build needs into third_party/."""
 
 import argparse
 import json
@@ -17,9 +17,9 @@ def git(directory, *args, capture=False, check=True):
 def main():
     dependencies = json.loads((ROOT / "dependencies.lock.json").read_text())
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("names", nargs="*", help="Default: ZArchive addrlib nWiiURecomp; optionally GhidraRPXLoader")
+    parser.add_argument("names", nargs="*", help="Default: all of dependencies.lock.json")
     args = parser.parse_args()
-    selected = args.names or ["ZArchive", "addrlib", "nWiiURecomp"]
+    selected = args.names or list(dependencies)
     for name in selected:
         if name not in dependencies:
             parser.error(f"Unknown dependency: {name}")
@@ -35,13 +35,6 @@ def main():
         actual = git(directory, "rev-parse", "HEAD", capture=True).stdout.strip()
         if actual != dependency["revision"]:
             parser.exit(1, f"Refusing to change existing {directory}: expected {dependency['revision']}, got {actual}\n")
-        for patch in sorted((ROOT / "patches" / name).glob("*.patch")):
-            if git(directory, "apply", "--reverse", "--check", str(patch), capture=True, check=False).returncode == 0:
-                print(f"{name}: already applied {patch.name}")
-                continue
-            git(directory, "apply", "--check", str(patch))
-            git(directory, "apply", str(patch))
-            print(f"{name}: applied {patch.name}")
         print(f"{name}: {actual}")
 
 

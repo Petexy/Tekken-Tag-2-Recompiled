@@ -3,14 +3,6 @@
     "url": "https://github.com/Exzap/ZArchive.git",
     "revision": "965b66c8d67b6b7e30fd63b3b75aa91a99ff303b"
   },
-  "nWiiURecomp": {
-    "url": "https://github.com/BlackLineInteractive/nWiiURecomp.git",
-    "revision": "d9118564dcedc45facf5adea06729799bfbc6774"
-  },
-  "GhidraRPXLoader": {
-    "url": "https://github.com/Maschell/GhidraRPXLoader.git",
-    "revision": "d496d4328f0d04da5ff72480606cdbf2b9019d81"
-  },
   "addrlib": {
     "url": "https://github.com/decaf-emu/addrlib.git",
     "revision": "194162c47469ce620dd2470eb767ff5e42f5954a"

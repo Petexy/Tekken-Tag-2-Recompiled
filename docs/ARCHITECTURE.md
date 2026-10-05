@@ -9,7 +9,7 @@ Tekken.rpx ──► cafe-recomp ──► generated/*.cpp  (one C++ function pe
                                       │
                  runtime/ (native Cafe OS: coreinit, gx2→Vulkan, snd, vpad, fs)
                                       │
-                 game/   (TTT2 overrides, names, mods) ──► ttt2 (ELF x86-64)
+                 PPC_FUNC(sub_...) overrides of guest functions ──► ttt2 (ELF x86-64)
 ```
 
 ## Why our own recompiler
@@ -18,13 +18,12 @@ nWiiURecomp lifts *basic blocks* that return to a dispatch loop with an
 instruction budget and an interpreter fallback: an accelerated emulator, built
 for hosting inside Cemu. A port wants *function-level* output (the
 XenonRecomp / N64Recomp model): `bl` is a C++ call, `blr` a return, every guest
-function a named, overridable C++ function. nWiiURecomp stays useful as an
-independent reference interpreter for differential tests.
+function a named, overridable C++ function. (nWiiURecomp was evaluated first
+and is not used.)
 
 ## Facts the design rests on
 
-Measured on the v16 RPX with `build/recomp/cafe-census`
-(`analysis/instruction-census.*`):
+Measured on the v16 RPX with `build/recomp/cafe-census`:
 
 | Fact | Consequence |
 | --- | --- |
@@ -78,8 +77,11 @@ Implemented in host C++, no guest-code interpretation:
 4. **vpad / padscore → SDL3 gamepad**.
 5. **nsysnet / nlibcurl / nn_\***: offline stubs.
 
-Cemu, decaf-emu and nWiiURecomp are references and test oracles only; nothing
-from them ships in the port.
+Cemu and decaf-emu were references for the system's and the GPU's behaviour,
+and Dolphin's interpreter is the instruction tests' oracle; no code from them
+is in this repository. Facts such as structure layouts, register values and
+the processor's estimate tables come from their reverse engineering and
+hardware measurements.
 
 Guest threads are host threads; every kernel object is examined and changed
 under one kernel lock. A blocked thread sleeps on a *wait channel* keyed by
@@ -327,7 +329,7 @@ attachment formats and blend state.
 
 ## Running the port
 
-`build-port/ttt2 "<path>/TEKKEN TAG 2 Wii U EDITION (EU).wua"` reads the
+`build/ttt2 "<path>/TEKKEN TAG 2 Wii U EDITION (EU).wua"` reads the
 executable and all assets from the archive in place (a directory with
 code/, content/, meta/ also works). Reading through the archive costs
 nothing measurable in play (`TTT2_TRACE_FS=1`): a fight reads ~0.5 MB of
@@ -376,7 +378,7 @@ Character select refuses a character already picked for the team.
 
 A guest memory fault prints the guest registers and backtrace, says when
 the address lies just below the stack pointer (a stack overflow), and
-gives the host code offset, which `addr2line -f -e build-port/ttt2
+gives the host code offset, which `addr2line -f -e build/ttt2
 <offset>` turns into the guest function. The main thread gets at least a
 2 MB stack whatever the RPX asks for (TTT2's says 64 KB, but its menus
 nest two functions with 501 KB frames).
@@ -422,7 +424,9 @@ per frame every ten seconds. Renderer debugging:
   machine states (edge integers, NaNs, infinities, denormals, random GQR
   formats) and must match Dolphin's Broadway interpreter bit for bit in every
   register and in memory. Dolphin is built from `third_party/ref` against a
-  shim (`tests/oracle/`) and is a test-only dependency. Result 2026-10-01: 0
+  shim (`tests/oracle/`; its `Interpreter.h` and `PowerPC.h` are derived from
+  the checkout at configure time) and is a test-only dependency: the test
+  programs contain GPL-2.0-or-later code and are not distributed. Result 2026-10-01: 0
   mismatches. One oracle correction: Dolphin's `addme`/`subfme` carry is
   wrong when CA=1 (architecture and Cemu agree on CA=1); the test documents it.
   Branches, `lwarx`/`stwcx.`, `dcbz` and traps are not covered by it yet.
