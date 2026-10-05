@@ -59,9 +59,14 @@ bool write_if_changed(const fs::path& path, const std::string& content) {
     return true;
 }
 
+// The executable the runtime is written for: TEKKEN TAG 2 Wii U EDITION,
+// Europe, update 16 (other versions differ in code and data layout).
+constexpr const char* kSupportedRpx = "fc0270465d384386f67804e48716e30bfbe85a5a1004e3a6bfe3ac75f9de5019";
+
 struct Options {
     fs::path rpx;
     fs::path output;
+    bool any_rpx = false;
     bool all = false;
     bool comments = true;
     size_t shard_instructions = 24000;
@@ -75,6 +80,10 @@ const char* kHeader =
 int run(const Options& options) {
     const auto started = std::chrono::steady_clock::now();
     const std::string digest = sha256_file(options.rpx);
+    if (digest != kSupportedRpx && !options.any_rpx) {
+        throw std::runtime_error(options.rpx.string() + " is not the Tekken.rpx of TEKKEN TAG 2 Wii U EDITION (EU) v16 (sha256 " +
+                                 digest + "), the version the runtime is written for; --any-rpx translates it anyway");
+    }
     const recomp::Program program = recomp::Program::analyze(rpx::load(options.rpx));
 
     std::vector<const recomp::Entry*> chosen;
@@ -242,6 +251,8 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--all") {
             options.all = true;
+        } else if (arg == "--any-rpx") {
+            options.any_rpx = true;
         } else if (arg == "--no-comments") {
             options.comments = false;
         } else if (arg == "--shard-instructions" && i + 1 < argc) {
@@ -261,7 +272,7 @@ int main(int argc, char** argv) {
     }
     if (positional.size() != 2) {
         std::fprintf(stderr,
-                     "usage: %s Tekken.rpx OUTPUT_DIR [--all] [--no-comments]\n"
+                     "usage: %s Tekken.rpx OUTPUT_DIR [--all] [--no-comments] [--any-rpx]\n"
                      "       [--shard-instructions N] [--only LO-HI]...\n",
                      argv[0]);
         return 2;
