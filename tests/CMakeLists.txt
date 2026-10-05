@@ -87,6 +87,14 @@ else()
     message(STATUS "semantics_test disabled: needs third_party/ref/dolphin, fmt and TTT2_RPX")
 endif()
 
+# The game's files from a .wua whose update is merged or beside the base
+# game (synthetic archives; no game data needed).
+add_executable(wua_layers_test wua_layers_test.cpp ${CMAKE_SOURCE_DIR}/runtime/src/wua.cpp)
+target_include_directories(wua_layers_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/src)
+target_compile_features(wua_layers_test PRIVATE cxx_std_20)
+target_link_libraries(wua_layers_test PRIVATE ZArchive::zarchive)
+add_test(NAME wua_layers_test COMMAND wua_layers_test)
+
 # Guest polling loops must see other threads' stores (no Dolphin needed).
 add_executable(memory_model_test memory_model_test.cpp)
 target_include_directories(memory_model_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include)

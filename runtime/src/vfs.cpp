@@ -1,16 +1,7 @@
 #include "cafe/vfs.h"
 
 #include "cafe/runtime.h"
-
-// Third-party header; not held to this project's warning flags.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#if defined(__clang__)
-#pragma GCC diagnostic ignored "-Wnested-anon-types"
-#endif
-#include <zarchive/zarchivereader.h>
-#pragma GCC diagnostic pop
+#include "wua.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -30,7 +21,7 @@ namespace fs = std::filesystem;
 
 struct Source {
     std::unique_ptr<ZArchiveReader> archive; // null: host directory
-    std::string archive_root;                // "<titleid>_v<n>" inside the archive
+    std::vector<std::string> layers;         // the game's folders in the archive, the first winning
     fs::path directory;
 };
 
@@ -195,6 +186,7 @@ Status list_host(const fs::path& path, Dir& dir) {
 } // namespace
 
 void open_game(const fs::path& source) {
+    g_source = Source{};
     std::error_code ec;
     if (fs::is_directory(source, ec)) {
         g_source.directory = source;
@@ -202,17 +194,13 @@ void open_game(const fs::path& source) {
     }
     g_source.archive.reset(ZArchiveReader::OpenFromFile(source));
     if (!g_source.archive) fatal("cannot open game archive %s", source.c_str());
-    // A title archive holds one directory per title/version.
-    const ZArchiveNodeHandle root = g_source.archive->LookUp("", false, true);
-    ZArchiveReader::DirEntry entry;
-    for (uint32_t i = 0; i < g_source.archive->GetDirEntryCount(root); ++i) {
-        if (g_source.archive->GetDirEntry(root, i, entry) && entry.isDirectory &&
-            g_source.archive->LookUp(std::string(entry.name) + "/code/Tekken.rpx") != ZARCHIVE_INVALID_NODE) {
-            g_source.archive_root = std::string(entry.name);
-            return;
-        }
+    g_source.layers = wua::game_layers(*g_source.archive);
+    if (g_source.layers.empty()) fatal("%s does not contain a title with code/Tekken.rpx", source.c_str());
+    if (g_source.layers.size() > 1) {
+        std::string order;
+        for (const std::string& layer : g_source.layers) order += (order.empty() ? "" : " over ") + layer;
+        std::fprintf(stderr, "ttt2: the game's files from %s\n", order.c_str());
     }
-    fatal("%s does not contain a title with code/Tekken.rpx", source.c_str());
 }
 
 void set_save_root(const fs::path& root) {
@@ -244,7 +232,7 @@ Status open_file(std::string_view path, std::string_view mode, int32_t& handle) 
         if (writing) return kPermissionError;
         return open_host(game_host_path(r.relative), "r", handle);
     }
-    const ZArchiveNodeHandle node = g_source.archive->LookUp(g_source.archive_root + "/" + r.relative);
+    const ZArchiveNodeHandle node = wua::find(*g_source.archive, g_source.layers, r.relative);
     if (node == ZARCHIVE_INVALID_NODE) return kNotFound;
     if (!g_source.archive->IsFile(node)) return kNotFile;
     if (writing) return kPermissionError;
@@ -358,7 +346,7 @@ Status stat_path(std::string_view path, Stat& stat) {
     if (r.area == Area::kSave) return stat_host(host_resolve(g_save_root, r.save_parts), stat);
     if (r.area != Area::kGame) return kNotFound;
     if (!g_source.archive) return stat_host(game_host_path(r.relative), stat);
-    const ZArchiveNodeHandle node = g_source.archive->LookUp(g_source.archive_root + "/" + r.relative);
+    const ZArchiveNodeHandle node = wua::find(*g_source.archive, g_source.layers, r.relative);
     if (node == ZARCHIVE_INVALID_NODE) return kNotFound;
     stat.directory = g_source.archive->IsDirectory(node);
     stat.size = stat.directory ? 0 : g_source.archive->GetFileSize(node);
@@ -386,16 +374,19 @@ Status open_dir(std::string_view path, int32_t& handle) {
     } else if (r.area == Area::kGame && !g_source.archive) {
         status = list_host(game_host_path(r.relative), dir);
     } else if (r.area == Area::kGame) {
-        const ZArchiveNodeHandle node =
-            g_source.archive->LookUp(g_source.archive_root + "/" + r.relative, false, true);
-        if (node != ZARCHIVE_INVALID_NODE) {
-            ZArchiveReader::DirEntry entry;
-            for (uint32_t i = 0; i < g_source.archive->GetDirEntryCount(node); ++i) {
-                if (!g_source.archive->GetDirEntry(node, i, entry)) continue;
+        const ZArchiveNodeHandle node = wua::find(*g_source.archive, g_source.layers, r.relative);
+        std::vector<wua::Entry> entries;
+        if (node == ZARCHIVE_INVALID_NODE) {
+            status = kNotFound;
+        } else if (!g_source.archive->IsDirectory(node)) {
+            status = kNotDir;
+        } else {
+            wua::list(*g_source.archive, g_source.layers, r.relative, entries);
+            for (wua::Entry& entry : entries) {
                 DirEntry e;
-                e.name = std::string(entry.name);
-                e.stat.directory = entry.isDirectory;
-                e.stat.size = entry.isFile ? entry.size : 0;
+                e.name = std::move(entry.name);
+                e.stat.directory = entry.directory;
+                e.stat.size = entry.size;
                 dir.entries.push_back(std::move(e));
             }
             status = kOk;

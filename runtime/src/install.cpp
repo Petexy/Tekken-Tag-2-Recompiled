@@ -8,16 +8,7 @@
 #include "cafe/generated.h"
 #include "cafe/runtime.h"
 #include "gpu/vulkan/png.h"
-
-// Third-party header; not held to this project's warning flags.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#if defined(__clang__)
-#pragma GCC diagnostic ignored "-Wnested-anon-types"
-#endif
-#include <zarchive/zarchivereader.h>
-#pragma GCC diagnostic pop
+#include "wua.h"
 
 #include <SDL3/SDL.h>
 
@@ -85,17 +76,9 @@ struct Entry {
     ZArchiveNodeHandle node = ZARCHIVE_INVALID_NODE;
 };
 
-void check_name(std::string_view name) {
-    const bool unsafe = name.empty() || name == "." || name == ".." ||
-                        std::any_of(name.begin(), name.end(), [](char c) {
-                            return c == '/' || c == '\\' || static_cast<unsigned char>(c) < 32;
-                        });
-    if (unsafe) fail("the game holds a file with an unsafe name: " + std::string(name));
-}
-
-// The title's files: in a .wua archive (a folder "<title id>_v<version>"
-// per title) or in a title folder (code/, content/, meta/, or an install
-// folder with them in game/).
+// The title's files: in a .wua archive (see wua.h: the update's files over
+// the base game's) or in a title folder (code/, content/, meta/, or an
+// install folder with them in game/).
 class Source {
 public:
     explicit Source(const fs::path& path) {
@@ -120,18 +103,9 @@ public:
         }
         archive_.reset(ZArchiveReader::OpenFromFile(path));
         if (!archive_) fail("cannot open " + path.string() + " as a .wua archive");
-        const ZArchiveNodeHandle root = archive_->LookUp("", false, true);
-        ZArchiveReader::DirEntry entry;
-        for (uint32_t i = 0; root != ZARCHIVE_INVALID_NODE && i < archive_->GetDirEntryCount(root); ++i) {
-            if (archive_->GetDirEntry(root, i, entry) && entry.isDirectory &&
-                archive_->LookUp(std::string(entry.name) + "/code/Tekken.rpx") != ZARCHIVE_INVALID_NODE) {
-                title_ = std::string(entry.name);
-                break;
-            }
-        }
-        if (title_.empty()) fail(path.string() + " holds no title with code/Tekken.rpx");
-        // In the archive's own order, which is the order of the data in it.
-        list(archive_->LookUp(title_, false, true), "", 0);
+        const std::vector<std::string> layers = wua::game_layers(*archive_);
+        if (layers.empty()) fail(path.string() + " holds no title with code/Tekken.rpx");
+        for (const wua::File& f : wua::game_files(*archive_, layers)) files_.push_back({f.path, f.size, f.node});
     }
 
     const std::vector<Entry>& files() const { return files_; }
@@ -174,21 +148,7 @@ public:
     }
 
 private:
-    void list(ZArchiveNodeHandle directory, const std::string& prefix, int depth) {
-        if (directory == ZARCHIVE_INVALID_NODE || depth > 64) fail("the archive's folders are damaged");
-        ZArchiveReader::DirEntry entry;
-        for (uint32_t i = 0; i < archive_->GetDirEntryCount(directory); ++i) {
-            if (!archive_->GetDirEntry(directory, i, entry)) fail("the archive's folders are damaged");
-            check_name(entry.name);
-            const std::string path = prefix.empty() ? std::string(entry.name) : prefix + "/" + std::string(entry.name);
-            const ZArchiveNodeHandle node = archive_->LookUp(title_ + "/" + path, entry.isFile, entry.isDirectory);
-            if (entry.isDirectory) list(node, path, depth + 1);
-            else files_.push_back({path, entry.size, node});
-        }
-    }
-
     std::unique_ptr<ZArchiveReader> archive_;
-    std::string title_;
     fs::path directory_;
     std::vector<Entry> files_;
     int fd_ = -1;

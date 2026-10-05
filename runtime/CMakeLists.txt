@@ -30,6 +30,7 @@ add_library(cafe_runtime OBJECT
     src/os/dmae.cpp
     src/os/hardware.cpp
     src/vfs.cpp
+    src/wua.cpp
     src/install.cpp
     src/gpu/command_processor.cpp
     src/gpu/display.cpp
