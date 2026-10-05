@@ -1,4 +1,4 @@
-# Tekken Tag Tournament 2 for Linux
+# Tekken Tag 2 Recompiled
 
 An unofficial native Linux port of **Tekken Tag Tournament 2 Wii U Edition**,
 made by static recompilation: the game's PowerPC code is translated to C++
@@ -92,7 +92,7 @@ are too old.
 ## Building
 
 ```bash
-git clone https://github.com/OWNER/REPO.git ttt2 && cd ttt2
+git clone https://github.com/Petexy/Tekken-Tag-2-Recompiled.git && cd Tekken-Tag-2-Recompiled
 python3 tools/setup_deps.py                      # ZArchive and AMD's addrlib, at pinned revisions
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
