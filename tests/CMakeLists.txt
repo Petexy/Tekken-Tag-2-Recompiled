@@ -64,6 +64,7 @@ if(EXISTS "${DOLPHIN_CORE}/Core/PowerPC/Interpreter/Interpreter_Tables.cpp"
     add_executable(semantics_test oracle/semantics_test.cpp "${semantics_cases}")
     target_include_directories(semantics_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include)
     target_link_libraries(semantics_test PRIVATE dolphin_oracle cafe_recomp)
+    target_compile_features(semantics_test PRIVATE cxx_std_20)
     target_compile_options(semantics_test PRIVATE -O2 -march=x86-64-v3 -Wno-unused-label)
     add_test(NAME semantics_test COMMAND semantics_test)
 
@@ -79,6 +80,7 @@ if(EXISTS "${DOLPHIN_CORE}/Core/PowerPC/Interpreter/Interpreter_Tables.cpp"
     target_include_directories(control_flow_test PRIVATE
         ${CMAKE_SOURCE_DIR}/runtime/include ${CMAKE_CURRENT_SOURCE_DIR}/oracle)
     target_link_libraries(control_flow_test PRIVATE dolphin_oracle)
+    target_compile_features(control_flow_test PRIVATE cxx_std_20)
     target_compile_options(control_flow_test PRIVATE -O2 -march=x86-64-v3 -Wno-unused-label)
     add_test(NAME control_flow_test COMMAND control_flow_test)
 else()
