@@ -57,7 +57,8 @@ the reachability bound sound.
 - Imports: calls to stub addresses become calls to
   `cafe_import_<module>_<name>`. The runtime defines the implemented ones;
   generated weak defaults stop with "unimplemented import" for the rest.
-- A names file maps addresses to readable names as they are identified.
+- Planned: a names file mapping addresses to readable names as they are
+  identified.
 
 ## Runtime (native Cafe OS)
 
@@ -389,7 +390,9 @@ host threads are named `<OSThread address>/<core>`. The export thunks take
 `(PPCContext&, uint8_t* base)`, so `$rsi` in any `imp_*` frame is the guest
 base address. `TTT2_TRACE_THREADS=1` logs thread creation, priorities,
 affinities and names. The GPU backends print frames per second and draws
-per frame every ten seconds. Renderer debugging:
+per frame every ten seconds. The captures, dumps and traces below hold the
+game's own images, shaders and sounds: write them under `local/`, which Git
+ignores. Renderer debugging:
 
 | Variable | Effect |
 | --- | --- |
@@ -430,8 +433,9 @@ per frame every ten seconds. Renderer debugging:
   mismatches. One oracle correction: Dolphin's `addme`/`subfme` carry is
   wrong when CA=1 (architecture and Cemu agree on CA=1); the test documents it.
   Branches, `lwarx`/`stwcx.`, `dcbz` and traps are not covered by it yet.
-- Reference checkouts (sparse, read-only, never shipped), recreate with
-  `git clone --filter=blob:none --sparse` at these revisions:
+- Reference checkouts (sparse, read-only, never shipped; the README's Tests
+  section has the commands for Dolphin's, a non-cone sparse checkout), at
+  these revisions:
   Dolphin `771fb154059c5812d6a715a23226249cc42877a2` into
   `third_party/ref/dolphin` (Source/Core/Core/PowerPC/Interpreter,
   Gekko.h, PowerPC.h, ConditionRegister.*, Common/{BitField,BitUtils,
@@ -461,5 +465,5 @@ per frame every ten seconds. Renderer debugging:
 | M2 | Runtime core, boot | Done 2026-10-01: the game runs its main loop at a steady 59.9 frames/s (vsync-paced) on the null GPU backend, every static import implemented |
 | M3 | GX2 → Vulkan | Done 2026-10-01: intro movie, logos, title screen, attract-mode fights, main menu and character select render correctly at ~58 frames/s |
 | M4 | Input, audio, filesystem, saves | Done 2026-10-02: menus and character select navigate, sound plays (checked from WAV dumps: content, levels, no buffer underruns), saves load and persist (the battle record survives a restart) |
-| M5 | Gameplay | Reached with scripted input 2026-10-02: an arcade match from character select through both rounds, K.O., continue and game over, back to the menu with the record updated. To confirm by hand with a keyboard or gamepad |
+| M5 | Gameplay | Reached with scripted input 2026-10-02: an arcade match from character select through both rounds, K.O., continue and game over, back to the menu with the record updated. Confirmed by hand 2026-10-05: a whole arcade mode played through |
 | M6 | Hardening | All stages/characters, long runs, performance |
