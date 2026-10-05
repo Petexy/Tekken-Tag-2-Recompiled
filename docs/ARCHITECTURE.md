@@ -343,7 +343,8 @@ is empty, new or an earlier install is the install folder; any other gets
 a "Tekken Tag Tournament 2" folder inside. The game is checked against
 the RPX hash the port was generated from before anything is copied, and
 against the free space. The install folder gets `game/` (code/,
-content/, meta/; 15.9 GB, ~4 minutes from a hard disk), the executable,
+content/, meta/; 15.9 GB, ~4 minutes from a hard disk), the executable
+named "Tekken Tag Tournament 2" (what users see; `ttt2` stays the build's name),
 `icon.png` (meta/iconTex.tga) and `.ttt2-install`, written last;
 `$XDG_CONFIG_HOME/ttt2/installed` names the folder, and
 `$XDG_DATA_HOME/applications/ttt2.desktop` puts it in the application menu

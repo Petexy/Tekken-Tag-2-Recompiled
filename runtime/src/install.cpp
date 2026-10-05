@@ -42,7 +42,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr const char* kFolderName = "Tekken Tag Tournament 2";
+// What the user sees: the installed program, its folder, its menu entry.
+constexpr const char* kName = "Tekken Tag Tournament 2";
 constexpr const char* kMarker = ".ttt2-install";      // written last: the install is complete
 constexpr const char* kStarted = ".ttt2-installing"; // written first: an install not finished yet
 
@@ -275,7 +276,7 @@ fs::path choose_folder() {
     std::fprintf(stderr, "ttt2: choose where to install it\n");
     std::optional<std::string> path =
         dialog(SDL_FILEDIALOG_OPENFOLDER, "Choose where to install Tekken Tag Tournament 2", start);
-    if (!path) path = ask("Install into", (start / kFolderName).string());
+    if (!path) path = ask("Install into", (start / kName).string());
     if (!path) fail("no install folder given: ttt2 --install GAME FOLDER");
     if (path->empty()) fail("no folder chosen");
     return *path;
@@ -305,8 +306,8 @@ fs::path install_folder(const fs::path& chosen) {
     if (usable(folder)) return folder;
     std::error_code ec;
     if (!fs::is_directory(folder, ec)) fail(folder.string() + " is not a folder");
-    if (usable(folder / kFolderName)) return folder / kFolderName;
-    fail((folder / kFolderName).string() + " already exists and is not an install of the port: choose another folder");
+    if (usable(folder / kName)) return folder / kName;
+    fail((folder / kName).string() + " already exists and is not an install of the port: choose another folder");
 }
 
 uint64_t free_space(fs::path folder) {
@@ -409,7 +410,7 @@ void copy_title(Source& source, const fs::path& game, uint32_t& changed) {
 }
 
 void install_executable(const fs::path& folder) {
-    const fs::path target = folder / "ttt2";
+    const fs::path target = folder / kName;
     std::error_code ec;
     if (fs::equivalent(kSelf, target, ec)) return; // the installed copy is running
     fs::path part = target;
@@ -423,6 +424,8 @@ void install_executable(const fs::path& folder) {
     }
     if (!ec) fs::rename(part, target, ec);
     if (ec) fail("cannot copy the executable to " + target.string() + ": " + ec.message());
+    // (Installs before it had its name called it ttt2.)
+    if (fs::is_regular_file(fs::symlink_status(folder / "ttt2", ec))) fs::remove(folder / "ttt2", ec);
 }
 
 void install_icon(const std::optional<std::vector<uint8_t>>& tga, const fs::path& folder) {
@@ -474,10 +477,12 @@ void install_launcher(const fs::path& folder) {
         std::ofstream out(part);
         out << "[Desktop Entry]\n"
                "Type=Application\n"
-               "Name=Tekken Tag Tournament 2\n"
+               "Name="
+            << kName
+            << "\n"
                "Comment=Tekken Tag Tournament 2 Wii U Edition, native port\n"
                "Exec="
-            << desktop_exec((folder / "ttt2").string())
+            << desktop_exec((folder / kName).string())
             << "\n"
                "Icon="
             << desktop_string((folder / "icon.png").string())
@@ -555,8 +560,8 @@ int install(const std::vector<std::string>& positional, bool launcher) {
         std::fprintf(stderr, "ttt2: kept %u %s from the game's (delete one and install again to restore it)\n", changed,
                      changed == 1 ? "file that differs" : "files that differ");
     }
-    std::fprintf(stderr, "ttt2: installed. Start it with %s%s\n", (folder / "ttt2").c_str(),
-                 launcher ? " or from the application menu (Tekken Tag Tournament 2)" : "");
+    std::fprintf(stderr, "ttt2: installed. Start %s%s\"%s\"\n", kName,
+                 launcher ? " from the application menu or with " : " with ", (folder / kName).c_str());
     std::fprintf(stderr, "ttt2: the .wua is no longer needed to play. After rebuilding the port, ttt2 --update copies the new "
                          "executable into the install.\n");
     return 0;

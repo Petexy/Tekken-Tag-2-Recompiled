@@ -182,8 +182,8 @@ To install it like any other program, run the built executable with
 into (the desktop's file dialogs; a terminal prompt without them), checks
 that the game is the one the port was made from, copies the game (16 GB),
 the executable and the game's icon there and adds "Tekken Tag Tournament 2"
-to the application menu. The installed `ttt2` then starts without
-arguments, and the `.wua` is no longer needed:
+to the application menu. The installed program, "Tekken Tag Tournament
+2", then starts without arguments, and the `.wua` is no longer needed:
 
 ```bash
 build-port/ttt2 --install                      # choose the .wua and the folder
