@@ -95,6 +95,12 @@ target_compile_features(wua_layers_test PRIVATE cxx_std_20)
 target_link_libraries(wua_layers_test PRIVATE ZArchive::zarchive)
 add_test(NAME wua_layers_test COMMAND wua_layers_test)
 
+# The title's file formats, icons and texts (synthetic data; no game files).
+add_executable(title_test title_test.cpp)
+target_link_libraries(title_test PRIVATE cafe_title)
+target_compile_options(title_test PRIVATE -Wall -Wextra)
+add_test(NAME title_test COMMAND title_test)
+
 # Guest polling loops must see other threads' stores (no Dolphin needed).
 add_executable(memory_model_test memory_model_test.cpp)
 target_include_directories(memory_model_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include)

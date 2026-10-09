@@ -90,6 +90,12 @@ struct Texture {
     bool dirty = true;       // the CPU wrote its memory since it was loaded
     const Target* source = nullptr; // render target the contents came from
     uint32_t scale = 1;     // image size over the resource's size (copied from upscaled targets)
+    // A replacement (gpu/replacements.h) matched the contents: its index,
+    // the generation of replacement contents loaded, whether the image is
+    // RGBA8 for them.
+    int replacement = -1;
+    uint64_t replacement_generation = 0;
+    bool rgba = false;
 };
 
 struct ShaderModule {

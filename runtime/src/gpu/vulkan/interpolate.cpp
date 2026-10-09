@@ -16,9 +16,13 @@
 // same key and the most similar data (begin_replay), and blends word by
 // word: values that look like ordinary floats in both frames move
 // linearly, anything else (integers, flags, NaNs) takes this frame's
-// value. Each block is read in the byte order in which its values look
-// like floats. Only depth-tested draws, the 3D scene, blend. When too few
-// draws match (a new scene), the extra frames show this frame as it is.
+// value, and so do values on a coarse grid in both frames (whole numbers
+// and multiples of 1/64: indices kept as floats, and the cell of a sprite
+// sheet a flipbook shows, such as the school stage's crowd), which step
+// from one to the next rather than move. Each block is read in the byte
+// order in which its values look like floats. Only depth-tested draws, the
+// 3D scene, blend. When too few draws match (a new scene), the extra
+// frames show this frame as it is.
 
 #include "gpu/vulkan/renderer.h"
 
@@ -67,6 +71,12 @@ bool big_endian(const uint8_t* data, uint32_t size) {
     return be > le;
 }
 
+// On the grid of whole numbers and their 64ths (below 2^16, where floats
+// are finer than that).
+bool on_grid(float x) {
+    return std::fabs(x) < 65536.0f && x * 64.0f == std::trunc(x * 64.0f);
+}
+
 void blend(uint8_t* out, const uint8_t* previous, const uint8_t* current, uint32_t size, float t, bool swapped) {
     for (uint32_t i = 0; i + 4 <= size; i += 4) {
         uint32_t a, b;
@@ -75,10 +85,10 @@ void blend(uint8_t* out, const uint8_t* previous, const uint8_t* current, uint32
         uint32_t v = b;
         if (a != b) {
             const uint32_t fa = swapped ? __builtin_bswap32(a) : a, fb = swapped ? __builtin_bswap32(b) : b;
-            if (ordinary(fa) && ordinary(fb)) {
-                float x, y;
-                std::memcpy(&x, &fa, 4);
-                std::memcpy(&y, &fb, 4);
+            float x, y;
+            std::memcpy(&x, &fa, 4);
+            std::memcpy(&y, &fb, 4);
+            if (ordinary(fa) && ordinary(fb) && !(on_grid(x) && on_grid(y))) {
                 const float r = x + (y - x) * t;
                 uint32_t fr;
                 std::memcpy(&fr, &r, 4);

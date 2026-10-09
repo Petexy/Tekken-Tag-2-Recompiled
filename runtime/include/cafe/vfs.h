@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -44,6 +45,12 @@ struct DirEntry {
 // `source` is a .wua file or a directory holding code/, content/, meta/.
 void open_game(const std::filesystem::path& source);
 void set_save_root(const std::filesystem::path& root);
+
+// The title's archive `archive` ("content/hdd/data003": its .ofs and .bin
+// files) with the entries named in `stored` (by name hash, as stored: see
+// title/archive.h) replaced. Call before the title runs; false if the
+// archive cannot take them.
+bool replace_archive_entries(const std::string& archive, const std::map<uint32_t, std::vector<uint8_t>>& stored);
 
 std::optional<std::vector<uint8_t>> read_whole(std::string_view path);
 

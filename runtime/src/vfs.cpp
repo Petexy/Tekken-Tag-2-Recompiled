@@ -1,6 +1,7 @@
 #include "cafe/vfs.h"
 
 #include "cafe/runtime.h"
+#include "title/archive.h"
 #include "wua.h"
 
 #include <fcntl.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -29,6 +31,10 @@ Source g_source;
 fs::path g_save_root;
 std::mutex g_mutex;
 
+// Archives served with entries replaced (replace_archive_entries), by the
+// relative path without extension, lower case.
+std::map<std::string, std::shared_ptr<const title::archive::Rebuilt>> g_overlays;
+
 struct File {
     bool archive = false;
     ZArchiveNodeHandle node = ZARCHIVE_INVALID_NODE;
@@ -38,6 +44,10 @@ struct File {
     bool readable = false;
     bool writable = false;
     bool append = false;
+    // An overlaid archive's index (served from memory) or data (pieces of
+    // the file opened above and of the replacements).
+    std::shared_ptr<const title::archive::Rebuilt> overlay;
+    bool overlay_index = false;
 };
 struct Dir {
     std::vector<DirEntry> entries;
@@ -46,6 +56,24 @@ struct Dir {
 std::unordered_map<int32_t, File> g_files;
 std::unordered_map<int32_t, Dir> g_dirs;
 int32_t g_next_handle = 1;
+
+std::string lower(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return text;
+}
+
+// The overlay serving `relative` ("content/hdd/data003.bin"), if any;
+// `index` tells the .ofs from the .bin.
+std::shared_ptr<const title::archive::Rebuilt> overlay_of(const std::string& relative, bool& index) {
+    if (g_overlays.empty() || relative.size() < 4) return nullptr;
+    const std::string name = lower(relative);
+    const std::string extension = name.substr(name.size() - 4);
+    if (extension != ".ofs" && extension != ".bin") return nullptr;
+    const auto it = g_overlays.find(name.substr(0, name.size() - 4));
+    if (it == g_overlays.end()) return nullptr;
+    index = extension == ".ofs";
+    return it->second;
+}
 
 bool iequals(std::string_view a, std::string_view b) {
     return a.size() == b.size() &&
@@ -183,7 +211,62 @@ Status list_host(const fs::path& path, Dir& dir) {
     return kOk;
 }
 
+// Opens a file of the game source for reading, without overlays.
+Status open_underlying(const std::string& relative, File& file) {
+    if (!g_source.archive) {
+        const fs::path path = game_host_path(relative);
+        struct stat st;
+        if (::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return kNotFile;
+        file.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (file.fd < 0) return from_errno(errno);
+        fstat(file.fd, &st);
+        file.size = static_cast<uint64_t>(st.st_size);
+        return kOk;
+    }
+    const ZArchiveNodeHandle node = wua::find(*g_source.archive, g_source.layers, relative);
+    if (node == ZARCHIVE_INVALID_NODE) return kNotFound;
+    if (!g_source.archive->IsFile(node)) return kNotFile;
+    file.archive = true;
+    file.node = node;
+    file.size = g_source.archive->GetFileSize(node);
+    return kOk;
+}
+
+uint64_t read_underlying(const File& file, uint64_t position, uint64_t size, void* buffer) {
+    if (file.archive) return g_source.archive->ReadFromFile(file.node, position, size, buffer);
+    uint64_t transferred = 0;
+    while (transferred < size) {
+        const ssize_t n = ::pread(file.fd, static_cast<uint8_t*>(buffer) + transferred, size - transferred,
+                                  static_cast<off_t>(position + transferred));
+        if (n <= 0) break;
+        transferred += static_cast<uint64_t>(n);
+    }
+    return transferred;
+}
+
+// The whole of a game file, or its start, without overlays.
+std::optional<std::vector<uint8_t>> read_underlying(const std::string& relative, uint64_t limit) {
+    File file;
+    if (open_underlying(relative, file) != kOk) return std::nullopt;
+    std::vector<uint8_t> data(std::min(file.size, limit));
+    const uint64_t n = read_underlying(file, 0, data.size(), data.data());
+    if (file.fd >= 0) ::close(file.fd);
+    if (n != data.size()) return std::nullopt;
+    return data;
+}
+
 } // namespace
+
+bool replace_archive_entries(const std::string& archive, const std::map<uint32_t, std::vector<uint8_t>>& stored) {
+    std::lock_guard lock(g_mutex);
+    const auto ofs = read_underlying(archive + ".ofs", UINT64_MAX);
+    const auto header = read_underlying(archive + ".bin", title::archive::kPayload);
+    if (!ofs || !header) return false;
+    auto rebuilt = title::archive::rebuild(*ofs, *header, stored);
+    if (!rebuilt) return false;
+    g_overlays[lower(archive)] = std::make_shared<const title::archive::Rebuilt>(std::move(*rebuilt));
+    return true;
+}
 
 void open_game(const fs::path& source) {
     g_source = Source{};
@@ -228,6 +311,22 @@ Status open_file(std::string_view path, std::string_view mode, int32_t& handle) 
     if (r.area == Area::kSave) return open_host(host_resolve(g_save_root, r.save_parts), mode, handle);
     if (r.area != Area::kGame) return kNotFound;
     const bool writing = !mode.empty() && (mode[0] != 'r' || mode.find('+') != std::string_view::npos);
+    bool index = false;
+    if (auto overlay = overlay_of(r.relative, index)) {
+        if (writing) return kPermissionError;
+        File file;
+        if (!index) { // the original data, read through
+            const Status status = open_underlying(r.relative, file);
+            if (status != kOk) return status;
+        }
+        file.overlay = std::move(overlay);
+        file.overlay_index = index;
+        file.size = index ? file.overlay->ofs.size() : file.overlay->bin_size;
+        file.readable = true;
+        handle = g_next_handle++;
+        g_files[handle] = std::move(file);
+        return kOk;
+    }
     if (!g_source.archive) {
         if (writing) return kPermissionError;
         return open_host(game_host_path(r.relative), "r", handle);
@@ -269,15 +368,25 @@ Status read_file(int32_t handle, void* buffer, uint64_t size, std::optional<uint
     transferred = 0;
     if (file.position < file.size) {
         const uint64_t want = std::min(size, file.size - file.position);
-        if (file.archive) {
-            transferred = g_source.archive->ReadFromFile(file.node, file.position, want, buffer);
-        } else {
-            while (transferred < want) {
-                const ssize_t n = ::pread(file.fd, static_cast<uint8_t*>(buffer) + transferred,
-                                          want - transferred, static_cast<off_t>(file.position + transferred));
-                if (n <= 0) break;
-                transferred += static_cast<uint64_t>(n);
+        if (file.overlay && file.overlay_index) {
+            std::memcpy(buffer, file.overlay->ofs.data() + file.position, want);
+            transferred = want;
+        } else if (file.overlay) {
+            auto* out = static_cast<uint8_t*>(buffer);
+            for (const title::archive::Piece& piece : file.overlay->bin) {
+                const uint64_t at = file.position + transferred;
+                if (transferred >= want) break;
+                if (piece.at + piece.size <= at || piece.at > at) continue;
+                const uint64_t n = std::min(want - transferred, piece.at + piece.size - at);
+                if (piece.data) {
+                    std::memcpy(out + transferred, piece.data->data() + (at - piece.at), n);
+                } else if (read_underlying(file, piece.source + (at - piece.at), n, out + transferred) != n) {
+                    break;
+                }
+                transferred += n;
             }
+        } else {
+            transferred = read_underlying(file, file.position, want, buffer);
         }
     }
     std::lock_guard lock(g_mutex);
@@ -345,6 +454,12 @@ Status stat_path(std::string_view path, Stat& stat) {
     const Resolved r = resolve(path);
     if (r.area == Area::kSave) return stat_host(host_resolve(g_save_root, r.save_parts), stat);
     if (r.area != Area::kGame) return kNotFound;
+    bool index = false;
+    if (const auto overlay = overlay_of(r.relative, index)) {
+        stat.directory = false;
+        stat.size = index ? overlay->ofs.size() : overlay->bin_size;
+        return kOk;
+    }
     if (!g_source.archive) return stat_host(game_host_path(r.relative), stat);
     const ZArchiveNodeHandle node = wua::find(*g_source.archive, g_source.layers, r.relative);
     if (node == ZARCHIVE_INVALID_NODE) return kNotFound;
@@ -393,6 +508,13 @@ Status open_dir(std::string_view path, int32_t& handle) {
         }
     }
     if (status != kOk) return status;
+    for (DirEntry& e : dir.entries) {
+        bool index = false;
+        if (r.area != Area::kGame || e.stat.directory) continue;
+        if (const auto overlay = overlay_of(r.relative + "/" + e.name, index)) {
+            e.stat.size = index ? overlay->ofs.size() : overlay->bin_size;
+        }
+    }
     handle = g_next_handle++;
     g_dirs[handle] = std::move(dir);
     return kOk;

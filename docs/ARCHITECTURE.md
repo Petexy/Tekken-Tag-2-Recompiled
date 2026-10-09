@@ -247,40 +247,46 @@ attachment formats and blend state.
   shaders that also write colour, which Vulkan discards when no colour
   attachment is bound; trimming those outputs would multiply shader
   variants.
-- Frame interpolation (`gpu/vulkan/interpolate.cpp`, default on displays
-  of 100 Hz or more, `TTT2_FPS=60/120/180/240`): the title's logic,
-  physics and hitboxes stay at 59.94 steps a second; between two of its
-  frames the renderer shows K-1 more. The command processor logs each
-  frame (register writes and operations with their arguments, nothing the
-  guest can observe) and replays it after the swap; every draw's constant
-  data (uniform blocks, buffer resources: camera, transforms, the
-  characters' bone matrices, fetched by the vertex shaders) is copied into
-  a GPU-visible record that the real draw reads too, and a replay blends
-  it with the previous frame's matching draw, value by value where both
-  are ordinary floats. Draws match by key (shaders, targets, vertex count
-  and first texture): first those whose data did not change, then each
-  with the most similar draw near its place among those with its key, so
-  sprites sharing a key keep their partners when others come and go (a
-  blinking cursor once paired every later menu sprite with its
-  neighbour). Only depth-tested (3D) draws blend: menus and the HUD place
-  parts of a widget with vertex data the CPU writes each frame, which a
-  replay cannot blend, so they are shown as the frame has them
+- Frame interpolation (`gpu/vulkan/interpolate.cpp`, default on displays of
+  100 Hz or more, `TTT2_FPS=60/120/180/240`): the title's logic, physics
+  and hitboxes stay at 59.94 steps a second; between two of its frames the
+  renderer shows K-1 more. The command processor logs each frame (register
+  writes and operations with their arguments, nothing the guest can
+  observe) and replays it after the swap; every draw's constant data
+  (uniform blocks, buffer resources: camera, transforms, the characters'
+  bone matrices, fetched by the vertex shaders) is copied into a
+  GPU-visible record that the real draw reads too, and a replay blends it
+  with the previous frame's matching draw, value by value where both are
+  ordinary floats, except values that are whole numbers or 64ths in both
+  frames: indices kept as floats and sprite-sheet cells step to this
+  frame's value (blending the school stage crowd's flipbook cell drew the
+  halves of neighbouring cells: legs above, bodies sunk into the ground;
+  Norway's fire drew blobs in the sky). Draws match by key (shaders,
+  targets, vertex count and first texture): first those whose data did not
+  change, then each with the most similar draw near its place among those
+  with its key, so sprites sharing a key keep their partners when others
+  come and go (a blinking cursor once paired every later menu sprite with
+  its neighbour). Only depth-tested (3D) draws blend: menus and the HUD
+  place parts of a widget with vertex data the CPU writes each frame, which
+  a replay cannot blend, so they are shown as the frame has them
   (`TTT2_INTERP_2D=1` blends them too). Draws whose data mostly jumps (a
   different object, a cut) and frames where fewer than 80% of draws match
-  are shown as they are. Replays skip anything that writes guest memory (stream-out writes,
-  CPU-side surface copies); render targets a frame reads before writing
-  them start replays from their start-of-frame content, and the next
-  frame sees the real frame's. With unblended replays
+  are shown as they are. Replays skip anything that writes guest memory
+  (stream-out writes, CPU-side surface copies); render targets a frame
+  reads before writing them start replays from their start-of-frame
+  content, and the next frame sees the real frame's. With unblended replays
   (`TTT2_INTERP_TEST=1`) every extra frame equals its real frame pixel for
   pixel (checked through menus, character select and fights). Particles
-  whose geometry the CPU rebuilds each frame and the HUD move at 60 Hz.
-  A frame whose swap comes while the GPU has yet to finish the previous
-  frame's images gets no extra frames (the previous image stays up
-  through their part of its slot): the title learns a frame is done only
-  after its replays, so on a shared or overloaded GPU they would slow the
-  game itself (measured: a fight on a desktop compositor taking ~80% of
-  the GPU went from 46-51 to 55-60 title frames a second; the statistics
-  line counts the extra frames skipped).
+  whose geometry the CPU rebuilds each frame and the HUD move at 60 Hz, and
+  so do models skinned through stream-out: in fights the fighters are
+  (point draws that write their skinned vertices), so their extra frames
+  show the real frame's pose. A frame whose swap comes while the GPU has
+  yet to finish the previous frame's images gets no extra frames (the
+  previous image stays up through their part of its slot): the title learns
+  a frame is done only after its replays, so on a shared or overloaded GPU
+  they would slow the game itself (measured: a fight on a desktop
+  compositor taking ~80% of the GPU went from 46-51 to 55-60 title frames a
+  second; the statistics line counts the extra frames skipped).
 - Presentation (`gpu/vulkan/present.cpp`) runs on its own thread and on a
   compute queue (AMD's asynchronous compute, `TTT2_PRESENT_BLIT=1` for
   the rendering queue): a present there waits only for its own frame, not
@@ -327,6 +333,94 @@ attachment formats and blend state.
   without.
 - Compiled SPIR-V and the Vulkan pipeline cache persist in
   `~/.cache/ttt2` (`$XDG_CACHE_HOME/ttt2`).
+
+## Presentation on a computer
+
+`runtime/src/title/` changes what the title shows, not how it plays, and
+makes everything from the Wii U game's own files at start-up
+(`title::prepare_presentation`, about 0.35 s).
+
+**The title's archives** (`title/archive.*`). `content/hdd/dataNNN.ofs`
+indexes `dataNNN.bin`: chunks `ofsi` (each entry's name hash and a word) and
+`ofsd` (one big-endian offset per entry into the `.bin`'s payload at 0x100,
+plus the end; entries are 16-byte aligned and the low four bits give the
+entry's length modulo 16). Every entry is scrambled by XOR with four 32-bit
+linear congruential streams, one per big-endian word of each 16-byte block,
+seeded from the name hash (x = x * 0xBDE95 + 0x8EF345, four times) and
+stepped once per block (w = w * 1531 + 5011); most Wii U entries are then a
+zlib stream behind a 16-byte `NRCZ` header (size, flags). Textures are
+`NTP3` (BC1/BC2/BC3 blocks in rows, or ARGB8), fonts an `NFH` glyph table
+plus an `NTP3` texture, texts `NTXB` banks. The update's data100 holds newer
+copies of a few entries, which the title reads first (a French text bank
+among them). The VFS can serve an archive with entries replaced
+(`vfs::replace_archive_entries`): a rebuilt index, and the `.bin` assembled
+from pieces of the original and the new entries.
+
+**Menu buttons.** The title's menus ask which button confirms and which
+cancels (`sub_03483B78`, `sub_03483C08`); the answer is a word at +8 of the
+system settings object built by `sub_0864107C` (from the PlayStation 3
+version's system setting; 1 on the Wii U: confirm with A, the right button).
+The port overrides `sub_0864107C` to keep the object's address and writes 0
+(confirm with the bottom button) unless a Nintendo controller is in use, at
+start and whenever the controller changes. The help bar's icons follow the
+same word. Fights read the buttons themselves, so they do not change.
+
+**Icons** (`title/font.*`, `title/draw.*`). Button icons are glyphs of the
+main font (data003, glyph table 3A27BC43, texture 4FC9A19E) at private-use
+code points that name a button by place (E024 right, E025 bottom, E026 top,
+E027 left, four on for highlighted ones; E036/E037 + and −; 2282/2283 L R,
+2286/2287 ZL ZR; 253C… the D-pad; E015-E023 Tekken button combinations). Two
+textures are made: neutral (face buttons as the font's own four-dot Tekken
+button pictures with that button's dot lit, Start and Select as arrows) and
+PlayStation-style (symbols, L1 R1 L2 R2, Start and Select, a split D-pad and
+coloured dots, drawn with 16 samples per pixel and the font's letters). The
+renderer swaps them in (`gpu/replacements.h`): a texture whose level 0 has a
+registered MD5 loads the current set as RGBA8 instead, and loads again when
+the controller changes (`host::on_controller_change`: the kind of the last
+gamepad pressed, SDL's PS3/PS4/PS5 and Switch types).
+
+**Fonts** (`title/font.*`). A glyph table (`NFH`) holds the font's size in
+pixels at +4 and the glyph count at +8 (little- or big-endian, by font),
+then from 0x450 a 32-byte record per glyph sorted by code point: from +4 its
+box in the texture (x, y), left bearing, top above the baseline, advance and
+line height (64ths of a pixel), width and height, and the code point
+(big-endian) at +22; the rest is bookkeeping (the glyph's place among those
+of its code points' high byte). Texts are drawn with the main font
+(24 px, 3A27BC43/4FC9A19E), a plain one (descriptions, 7C74E49A/099AF947)
+and the Korean and Japanese gothic fonts (22 px, help panels such as
+Controller Setup; B1277EE3/C4C9633E, 46B70814/335915C9), which have Latin
+letters; only the main font has the icon glyphs.
+
+**Texts** (`title/text.*`). An `NTXB` record is the key (padded to four with
+at least one zero), two bytes, the length in characters, the UTF-8 text and
+the English original (each padded with at least two zeros); the bank's index
+points at records, so a text can change in place. In every bank (data003's
+and data100's), names of the Wii U's buttons (English, French, Italian,
+German, Spanish: "the X Button", "bouton X", "X-Knopf", "+Control Pad", …)
+become the buttons' icons, which are always shorter, and the prompt "PRESS
+THE + BUTTON" and its translations show the Start icon. An icon in a text is
+a symbol no text uses that all four fonts have (£ ¥ ¢ ª for the right,
+bottom, top and left buttons, ＼ ³ » for +, − and the D-pad), its glyph
+changed in each: in the main font to the icon's box and placement, in the
+others to a box over unused glyphs (Þ, Œ, …; unused ideographs and Hangul
+in the gothic fonts) where the icon is drawn, scaled to 21 texels, into the
+font's texture (one per kind of controller). The changed banks and glyph
+tables reach the title through the archive overlays.
+
+**Title screen** (`title/title_screen.*`). The logo is a video ending on the
+still in the title screen's texture set (data007 76C7E3CF). The new logo is
+that still without "Wii U Edition": rows below the "TAG TOURNAMENT 2" banner
+fade to black (the kanji tucked behind it), the subtitle's stroke that curls
+up beside the banner is removed (thin bright parts connected to the
+subtitle), and the logo moves 54 rows down. Video frames (BT.601
+limited-range planes passed to the renderer's plane filter) that fit
+a * Wii U still + b (least squares over the logo, b from the black around
+it, the fit explaining over half the variance) become a * new still + b plus
+what the fit left (the fade from white and the light sweeping over the
+logo), small differences dropped as coding noise and the rest blurred where
+the stills differ; chroma moves by a * the stills' difference. The copyright
+lines (700x32 textures) lose the three words before the last seven ("Wii U
+EDITION" before "& (C) 2012 …") and are centred again.
 
 ## Running the port
 
@@ -418,6 +512,9 @@ ignores. Renderer debugging:
 | `TTT2_AUDIO_DUMP=<file.wav>` | everything played, as 48 kHz stereo WAV (also without a device) |
 | `TTT2_TRACE_AX=1` | voice set-up, device mixes, output level |
 | `TTT2_TRACE_FS=1` | file and save opens, reads and writes, with times |
+| `TTT2_TRACE_TEXTURES=1` | every texture loaded from memory once, with the MD5 a replacement names |
+| `TTT2_TRACE_PRESENTATION=1` | how long the icons, texts and logo took to prepare |
+| `TTT2_CONTROLLER=playstation/nintendo/xbox` | icons and menu buttons for this kind of controller |
 
 ## Verification
 

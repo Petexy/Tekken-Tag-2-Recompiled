@@ -4,21 +4,27 @@
 // SQ_TEX_RESOURCE words). Its contents come from guest memory, detiled,
 // or from a render target at the same address if the GPU wrote that last.
 // GX2Invalidate (SURFACE_SYNC) marks textures whose memory the CPU wrote;
-// a dirty texture reloads if the data's hash changed.
+// a dirty texture reloads if the data's hash changed. Textures matching a
+// replacement (gpu/replacements.h) show its RGBA8 contents instead.
 
 #include "gpu/vulkan/renderer.h"
 
 #include "gpu/latte.h"
+#include "gpu/replacements.h"
 #include "gpu/tiling.h"
 #include "gx2/internal.h"
 
 #include "cafe/runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <string>
+
+#include <openssl/evp.h>
 
 namespace cafe::gpu::vk {
 namespace {
@@ -162,7 +168,7 @@ void Renderer::create_texture_image(Texture& t, uint32_t scale) {
         destroy_image(t.image);
     }
     const Resource r = decode(t.words.data());
-    const FormatInfo f = color_format(r.format);
+    const FormatInfo f = color_format(t.rgba ? fmt::k8_8_8_8 : r.format);
     t.scale = scale;
     const uint32_t layers = r.depth;
     t.image = create_image(f.format, VK_IMAGE_ASPECT_COLOR_BIT, r.width * scale, r.height * scale, layers,
@@ -327,6 +333,10 @@ void Renderer::load_texture(Texture& t) {
     // Render targets at the texture's address, written after the CPU last
     // wrote the memory, hold the contents.
     if (load_texture_from_targets(t)) return;
+    if (t.replacement >= 0 && t.replacement_generation != gpu::texture_replacements_generation()) {
+        t.dirty = true; // shows a replacement whose contents changed
+        t.hash = 0;
+    }
     if (!t.dirty && t.source == nullptr) return;
     // A replay renders the frame's data again: what the CPU wrote since is the next frame's.
     if (replaying_ && t.loaded != 0) return;
@@ -354,18 +364,10 @@ void Renderer::load_texture(Texture& t) {
 
     const uint32_t first_non_macro = (s.swizzle >> 16) & 0xFF;
     const uint32_t block = f.compressed ? 4 : 1;
-    end_rendering();
-    barrier();
-    for (uint32_t level = 0; level < s.mip_levels; ++level) {
+    const auto tiled_level = [&](uint32_t level) {
         const gx2::SurfaceInfo li = gx2::surface_info(s, level);
         uint32_t level_address = level == 0 ? uint32_t{s.image} : s.mipmaps + (level > 1 ? uint32_t{s.mip_level_offset[level - 1]} : 0u);
         const uint32_t swizzle = gx2::is_macro_tiled(li.tile_mode) && level < first_non_macro ? (s.swizzle & 0x700) : 0;
-        const uint32_t width = std::max(1u, r.width >> level), height = std::max(1u, r.height >> level);
-        const uint32_t ew = (width + block - 1) / block, eh = (height + block - 1) / block;
-        const uint32_t slices = r.dim == gx2::kDim3D ? std::max(1u, r.depth >> level) : r.depth;
-        const VkDeviceSize bytes = VkDeviceSize{ew} * eh * slices * f.bytes;
-        VkDeviceSize offset = 0;
-        uint8_t* staging = upload(bytes, 16, offset);
         TiledLevel tl{};
         tl.data = guest_pointer(level_address);
         tl.base256b = (level_address | swizzle) >> 8;
@@ -376,7 +378,105 @@ void Renderer::load_texture(Texture& t) {
         tl.slices = std::max(li.depth, 1u);
         tl.samples = 1;
         tl.depth = r.depth_tiles;
-        detile(tl, ew, eh, 0, slices, staging);
+        return tl;
+    };
+    // Level 0 in rows, for the replacements and TTT2_TRACE_TEXTURES (which
+    // prints the MD5 a replacement names).
+    static const bool trace = std::getenv("TTT2_TRACE_TEXTURES") != nullptr;
+    std::array<uint8_t, 16> md5{};
+    const auto& replacements = gpu::texture_replacements();
+    const bool candidate = r.dim == gx2::kDim2D && r.depth == 1 &&
+                           std::any_of(replacements.begin(), replacements.end(), [&](const gpu::TextureReplacement& c) {
+                               return c.width == r.width && c.height == r.height && c.format == hw;
+                           });
+    if (candidate || (trace && hw != fmt::k8)) {
+        const uint32_t ew = (r.width + block - 1) / block, eh = (r.height + block - 1) / block;
+        std::vector<uint8_t> level0(size_t{ew} * eh * f.bytes);
+        detile(tiled_level(0), ew, eh, 0, 1, level0.data());
+        unsigned int length = 0;
+        EVP_Digest(level0.data(), level0.size(), md5.data(), &length, EVP_md5(), nullptr);
+        if (trace) {
+            static std::set<std::array<uint8_t, 16>> seen;
+            if (seen.insert(md5).second) {
+                char hex[33];
+                for (int i = 0; i < 16; ++i) std::snprintf(hex + 2 * i, 3, "%02x", md5[i]);
+                std::fprintf(stderr, "ttt2: texture 0x%08X %ux%u format 0x%03X levels %u md5 %s (frame %llu)\n",
+                             uint32_t{s.image}, r.width, r.height, r.format, uint32_t{s.mip_levels}, hex,
+                             static_cast<unsigned long long>(frame_number_));
+            }
+        }
+    }
+    t.replacement = -1;
+    for (size_t i = 0; candidate && i < replacements.size(); ++i) {
+        const gpu::TextureReplacement& c = replacements[i];
+        if (c.width == r.width && c.height == r.height && c.format == hw && c.md5 == md5) t.replacement = static_cast<int>(i);
+    }
+    const std::vector<uint8_t>* replaced = nullptr;
+    if (t.replacement >= 0) {
+        t.replacement_generation = gpu::texture_replacements_generation();
+        replaced = replacements[t.replacement].contents();
+        if (replaced && replaced->size() != size_t{r.width} * r.height * 4) replaced = nullptr;
+    }
+    if ((replaced != nullptr) != t.rgba) {
+        t.rgba = replaced != nullptr;
+        create_texture_image(t, 1);
+    }
+    end_rendering();
+    barrier();
+    if (replaced) {
+        // Level 0 as given, each smaller level the average of the one above.
+        std::vector<uint8_t> level(*replaced);
+        uint32_t width = r.width, height = r.height;
+        for (uint32_t i = 0;; ++i) {
+            VkDeviceSize offset = 0;
+            std::memcpy(upload(level.size(), 16, offset), level.data(), level.size());
+            VkBufferImageCopy region{};
+            region.bufferOffset = offset;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+            region.imageExtent = {width, height, 1};
+            vkCmdCopyBufferToImage(cmd(), ring_.buffer(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            if (i + 1 >= s.mip_levels || (width == 1 && height == 1)) break;
+            const uint32_t w = std::max(1u, width / 2), h = std::max(1u, height / 2);
+            std::vector<uint8_t> smaller(size_t{w} * h * 4);
+            for (uint32_t y = 0; y < h; ++y) {
+                for (uint32_t x = 0; x < w; ++x) {
+                    for (uint32_t k = 0; k < 4; ++k) {
+                        uint32_t sum = 0;
+                        for (uint32_t dy = 0; dy < 2; ++dy) {
+                            for (uint32_t dx = 0; dx < 2; ++dx) {
+                                const uint32_t sx = std::min(width - 1, 2 * x + dx), sy = std::min(height - 1, 2 * y + dy);
+                                sum += level[(size_t{sy} * width + sx) * 4 + k];
+                            }
+                        }
+                        smaller[(size_t{y} * w + x) * 4 + k] = static_cast<uint8_t>((sum + 2) / 4);
+                    }
+                }
+            }
+            level = std::move(smaller);
+            width = w;
+            height = h;
+        }
+        barrier();
+        profile_mark("texture replaced", uint32_t{s.image}, r.width, r.height);
+        return;
+    }
+    const gpu::PlaneFilter& plane_filter = gpu::plane_filter();
+    for (uint32_t level = 0; level < s.mip_levels; ++level) {
+        const uint32_t width = std::max(1u, r.width >> level), height = std::max(1u, r.height >> level);
+        const uint32_t ew = (width + block - 1) / block, eh = (height + block - 1) / block;
+        const uint32_t slices = r.dim == gx2::kDim3D ? std::max(1u, r.depth >> level) : r.depth;
+        const VkDeviceSize bytes = VkDeviceSize{ew} * eh * slices * f.bytes;
+        VkDeviceSize offset = 0;
+        uint8_t* staging = upload(bytes, 16, offset);
+        if (level == 0 && hw == fmt::k8 && slices == 1 && plane_filter) {
+            // (Staging memory is slow to read back.)
+            std::vector<uint8_t> plane(bytes);
+            detile(tiled_level(level), ew, eh, 0, slices, plane.data());
+            plane_filter(uint32_t{s.image}, ew, eh, plane.data());
+            std::memcpy(staging, plane.data(), plane.size());
+        } else {
+            detile(tiled_level(level), ew, eh, 0, slices, staging);
+        }
         if (hw == fmt::k8_24) { // 24-bit unorm depth in the low bits, as a float
             auto* v = reinterpret_cast<uint32_t*>(staging);
             for (VkDeviceSize i = 0; i < bytes / 4; ++i) {
