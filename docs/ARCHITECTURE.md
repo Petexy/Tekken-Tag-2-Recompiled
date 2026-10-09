@@ -247,40 +247,46 @@ attachment formats and blend state.
   shaders that also write colour, which Vulkan discards when no colour
   attachment is bound; trimming those outputs would multiply shader
   variants.
-- Frame interpolation (`gpu/vulkan/interpolate.cpp`, default on displays
-  of 100 Hz or more, `TTT2_FPS=60/120/180/240`): the title's logic,
-  physics and hitboxes stay at 59.94 steps a second; between two of its
-  frames the renderer shows K-1 more. The command processor logs each
-  frame (register writes and operations with their arguments, nothing the
-  guest can observe) and replays it after the swap; every draw's constant
-  data (uniform blocks, buffer resources: camera, transforms, the
-  characters' bone matrices, fetched by the vertex shaders) is copied into
-  a GPU-visible record that the real draw reads too, and a replay blends
-  it with the previous frame's matching draw, value by value where both
-  are ordinary floats. Draws match by key (shaders, targets, vertex count
-  and first texture): first those whose data did not change, then each
-  with the most similar draw near its place among those with its key, so
-  sprites sharing a key keep their partners when others come and go (a
-  blinking cursor once paired every later menu sprite with its
-  neighbour). Only depth-tested (3D) draws blend: menus and the HUD place
-  parts of a widget with vertex data the CPU writes each frame, which a
-  replay cannot blend, so they are shown as the frame has them
+- Frame interpolation (`gpu/vulkan/interpolate.cpp`, default on displays of
+  100 Hz or more, `TTT2_FPS=60/120/180/240`): the title's logic, physics
+  and hitboxes stay at 59.94 steps a second; between two of its frames the
+  renderer shows K-1 more. The command processor logs each frame (register
+  writes and operations with their arguments, nothing the guest can
+  observe) and replays it after the swap; every draw's constant data
+  (uniform blocks, buffer resources: camera, transforms, the characters'
+  bone matrices, fetched by the vertex shaders) is copied into a
+  GPU-visible record that the real draw reads too, and a replay blends it
+  with the previous frame's matching draw, value by value where both are
+  ordinary floats, except values that are whole numbers or 64ths in both
+  frames: indices kept as floats and sprite-sheet cells step to this
+  frame's value (blending the school stage crowd's flipbook cell drew the
+  halves of neighbouring cells: legs above, bodies sunk into the ground;
+  Norway's fire drew blobs in the sky). Draws match by key (shaders,
+  targets, vertex count and first texture): first those whose data did not
+  change, then each with the most similar draw near its place among those
+  with its key, so sprites sharing a key keep their partners when others
+  come and go (a blinking cursor once paired every later menu sprite with
+  its neighbour). Only depth-tested (3D) draws blend: menus and the HUD
+  place parts of a widget with vertex data the CPU writes each frame, which
+  a replay cannot blend, so they are shown as the frame has them
   (`TTT2_INTERP_2D=1` blends them too). Draws whose data mostly jumps (a
   different object, a cut) and frames where fewer than 80% of draws match
-  are shown as they are. Replays skip anything that writes guest memory (stream-out writes,
-  CPU-side surface copies); render targets a frame reads before writing
-  them start replays from their start-of-frame content, and the next
-  frame sees the real frame's. With unblended replays
+  are shown as they are. Replays skip anything that writes guest memory
+  (stream-out writes, CPU-side surface copies); render targets a frame
+  reads before writing them start replays from their start-of-frame
+  content, and the next frame sees the real frame's. With unblended replays
   (`TTT2_INTERP_TEST=1`) every extra frame equals its real frame pixel for
   pixel (checked through menus, character select and fights). Particles
-  whose geometry the CPU rebuilds each frame and the HUD move at 60 Hz.
-  A frame whose swap comes while the GPU has yet to finish the previous
-  frame's images gets no extra frames (the previous image stays up
-  through their part of its slot): the title learns a frame is done only
-  after its replays, so on a shared or overloaded GPU they would slow the
-  game itself (measured: a fight on a desktop compositor taking ~80% of
-  the GPU went from 46-51 to 55-60 title frames a second; the statistics
-  line counts the extra frames skipped).
+  whose geometry the CPU rebuilds each frame and the HUD move at 60 Hz, and
+  so do models skinned through stream-out: in fights the fighters are
+  (point draws that write their skinned vertices), so their extra frames
+  show the real frame's pose. A frame whose swap comes while the GPU has
+  yet to finish the previous frame's images gets no extra frames (the
+  previous image stays up through their part of its slot): the title learns
+  a frame is done only after its replays, so on a shared or overloaded GPU
+  they would slow the game itself (measured: a fight on a desktop
+  compositor taking ~80% of the GPU went from 46-51 to 55-60 title frames a
+  second; the statistics line counts the extra frames skipped).
 - Presentation (`gpu/vulkan/present.cpp`) runs on its own thread and on a
   compute queue (AMD's asynchronous compute, `TTT2_PRESENT_BLIT=1` for
   the rendering queue): a present there waits only for its own frame, not
