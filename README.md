@@ -35,6 +35,14 @@ and shaders are translated to Vulkan as it runs.
 - **Even frame pacing** on 120 Hz and 240 Hz displays (with
   `VK_KHR_present_wait2`): the game's clock follows the display's
   refreshes, so every image stays on screen equally long.
+- **Controls and icons as on a computer**: menus confirm with the bottom face
+  button and go back with the right one, as on the other consoles (Nintendo
+  controllers keep the Wii U's way). Button icons follow the controller in
+  use: PlayStation controllers get PlayStation-style icons, any other
+  neutral ones that show each face button by its place on the pad. The
+  game's texts show the icons where they named the Wii U's buttons, and the
+  title screen's logo no longer says "Wii U Edition". All of it is made by
+  the port from the Wii U game's own files.
 - **Installs like any other program**: `ttt2 --install` copies the game into
   a folder you choose and adds it to the application menu.
 - **Made to be modified**: every function of the game is a C++ function that
@@ -150,7 +158,11 @@ Saves go to `~/.local/share/ttt2/save` and compiled shaders to
 
 Keys go by position, as on a US QWERTY keyboard. Gamepads work through SDL
 by button position, as on the Wii U: the right face button is A, the bottom
-one B, the top one X and the left one Y.
+one B, the top one X and the left one Y, and fights use them that way. In
+menus the bottom button (B, Z on the keyboard) confirms and the right one
+goes back, except with a Nintendo controller, which confirms with its A as on
+the Wii U. The icons follow the last controller used (the keyboard counts as
+a neutral one).
 
 | Environment variable | Effect |
 | --- | --- |
@@ -160,6 +172,7 @@ one B, the top one X and the left one Y.
 | `TTT2_AUDIO=0` | no sound |
 | `TTT2_AUDIO_VOLUME=0..100` | volume in percent (default 100) |
 | `TTT2_SAVE_DIR=<folder>` | where saves go |
+| `TTT2_CONTROLLER=playstation/nintendo/xbox` | icons and menu buttons for this kind of controller, whichever is used |
 
 Debugging variables are listed in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#running-the-port).
@@ -177,7 +190,12 @@ Debugging variables are listed in
   buffers, which a command processor executes; the Vulkan renderer
   (`runtime/src/gpu/vulkan/`) translates the GPU's shaders to SPIR-V
   (`runtime/src/latte/`), interpolates frames and paces presentation.
-- `tests/`: a memory-model test, a test of reading split archives, and
+- `runtime/src/title/`: what this game shows differently on a computer: the
+  menu buttons, the icon sets, texts and the title screen, made at start-up
+  from the game's archives (their format is described in
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#presentation-on-a-computer)).
+- `tests/`: a memory-model test, tests of reading split archives and of the
+  game's file formats and the icons and texts made from them, and
   differential tests that run every instruction form the game uses against
   Dolphin's PowerPC interpreter.
 
@@ -206,11 +224,11 @@ cmake --build build      # also builds the tests
 ctest --test-dir build
 ```
 
-runs `memory_model_test` and `wua_layers_test`. The differential tests
-(`semantics_test`, `control_flow_test`) also need `fmt`, the game's
-`Tekken.rpx` (by default `local/wua/000500001010f800_v16/code/Tekken.rpx`;
-otherwise configure with `-DTTT2_RPX=<path>`), and a partial checkout of
-Dolphin:
+runs `memory_model_test`, `wua_layers_test` and `title_test`. The
+differential tests (`semantics_test`, `control_flow_test`) also need `fmt`,
+the game's `Tekken.rpx` (by default
+`local/wua/000500001010f800_v16/code/Tekken.rpx`; otherwise configure with
+`-DTTT2_RPX=<path>`), and a partial checkout of Dolphin:
 
 ```bash
 git clone --filter=blob:none --no-checkout https://github.com/dolphin-emu/dolphin.git third_party/ref/dolphin

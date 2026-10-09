@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <thread>
 
 namespace cafe::host {
@@ -73,6 +74,56 @@ constexpr PadButton kPadButtons[] = {
     {SDL_GAMEPAD_BUTTON_GUIDE, os::vpad::kHome},       {SDL_GAMEPAD_BUTTON_LEFT_STICK, os::vpad::kStickL},
     {SDL_GAMEPAD_BUTTON_RIGHT_STICK, os::vpad::kStickR},
 };
+
+// ------------------------------------------------------------ controller kind
+
+std::atomic<Controller> g_controller{Controller::kOther};
+bool g_controller_fixed = false;
+bool g_controller_used = false; // a button or stick moved: added pads no longer count
+std::function<void(Controller)> g_controller_callback;
+
+Controller kind_of(SDL_JoystickID id) {
+    switch (SDL_GetGamepadTypeForID(id)) {
+    case SDL_GAMEPAD_TYPE_PS3:
+    case SDL_GAMEPAD_TYPE_PS4:
+    case SDL_GAMEPAD_TYPE_PS5: return Controller::kPlayStation;
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: return Controller::kNintendo;
+    default: return Controller::kOther;
+    }
+}
+
+void set_controller(Controller kind) {
+    if (g_controller_fixed || g_controller.exchange(kind) == kind) return;
+    if (g_controller_callback) g_controller_callback(kind);
+}
+
+// Which controller the player picked up: the one with the latest input; a
+// pad plugged in counts until anything is pressed.
+void note_controller(const SDL_Event& event) {
+    switch (event.type) {
+    case SDL_EVENT_GAMEPAD_ADDED:
+        if (!g_controller_used) set_controller(kind_of(event.gdevice.which));
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        g_controller_used = true;
+        set_controller(kind_of(event.gbutton.which));
+        break;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (std::abs(event.gaxis.value) > 16000) {
+            g_controller_used = true;
+            set_controller(kind_of(event.gaxis.which));
+        }
+        break;
+    case SDL_EVENT_KEY_DOWN:
+        g_controller_used = true;
+        set_controller(Controller::kOther);
+        break;
+    default: break;
+    }
+}
 
 float axis(SDL_Gamepad* pad, SDL_GamepadAxis a) {
     const float v = SDL_GetGamepadAxis(pad, a) / 32767.0f;
@@ -162,11 +213,26 @@ void set_window_icon(const std::vector<uint8_t>& rgba, uint32_t width, uint32_t 
     SDL_DestroySurface(icon);
 }
 
+Controller active_controller() { return g_controller; }
+
+void on_controller_change(std::function<void(Controller)> callback) {
+    g_controller_callback = std::move(callback);
+    if (const char* forced = std::getenv("TTT2_CONTROLLER")) {
+        const std::string kind = forced;
+        g_controller = kind == "playstation" ? Controller::kPlayStation
+                       : kind == "nintendo"  ? Controller::kNintendo
+                                             : Controller::kOther;
+        g_controller_fixed = true;
+    }
+    if (g_controller_callback) g_controller_callback(g_controller);
+}
+
 bool run_event_loop(const std::function<bool()>& finished) {
     using namespace std::chrono_literals;
     while (!finished()) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
+            note_controller(event);
             switch (event.type) {
             case SDL_EVENT_QUIT:
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED: return false;

@@ -19,6 +19,14 @@ bool window_open();
 // The window's icon, RGBA rows top first. Main thread only.
 void set_window_icon(const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height);
 
+// The kind of controller the player uses: the last one pressed (gamepads
+// by their maker's button names; the keyboard counts as kOther).
+// TTT2_CONTROLLER=playstation, nintendo or xbox sets it for good.
+enum class Controller { kOther, kPlayStation, kNintendo };
+Controller active_controller();
+// Called on the event loop's thread when the kind changes.
+void on_controller_change(std::function<void(Controller)> callback);
+
 // Runs the event loop until `finished` returns true or the window closes.
 // Returns false if the user closed the window.
 bool run_event_loop(const std::function<bool()>& finished);
