@@ -115,6 +115,44 @@ VOICE_PREFIX = 'vp'           # her intro and win lines' events in Tekken 7's ba
 ALIGN = [('heihachi', 13), ('self', 13), ('heihachi', 14), ('self', 42), ('heihachi', 9), ('self', 23)]
 MOVESET = {
     'name': '[ELIZA]',
+    # Her low kick exists, but the imported neutral dispatcher omits d+4.
+    'jump_special_inputs': ('Vp_jp214lk', 'Vp_jp214rk', 'Vp_jp214wk'),
+    'neutral_inputs': {'Jn_syark00': (4, 0x40000008)},
+    'tag_launchers': {'Vp_66lklk': 'Ju_s_tlk'},  # Moon Glide 3,3; Jun's native tag exit
+    'bounds': {'Vp_6rklkrk': False, 'Vp_rk00': False, 'Vp_shoryulprk': False},  # Moon Glide 3,4 (Helical Flow)
+    # Replace T7 extended-point references with native arm capsules. The
+    # original 0x8213 parameters identify hand 13 (Storm) / 9 (Tempest).
+    'hitboxes': {
+        'Vp_214A': (13, 0, 13, 12),
+        'Vp_214B': (9, 0, 9, 8),
+        'Vp_214ABEX': (9, 0, 9, 8),
+        'Vp_214ABEX2': (13, 0, 13, 12),
+    },
+    # Preserve her own crouching / WS / back-turned attacks instead of
+    # borrowing donor rows that do not contain Eliza's special-input capture.
+    'own_moves': r'^(Vp_.*|Jn_(syalp00|t_slp00)|Co_(s_tlp00|R_(rp00L|lp00R|crp00L|clp00R)))$',
+    'special_cancels': {
+        name: ('Vp_energyA', 'Vp_energyB', 'Vp_shoryu', 'Vp_shoryuB',
+               'Vp_214A', 'Vp_214B', 'Vp_shoryuC', 'Vp_shoryuD',
+               'Vp_energySP', 'Vp_shoryuAB', 'Vp_214ABEX', 'Vp_shoryuCDEX',
+               'Vp_dash_EX', 'Vp_hadohAB')
+        for name in ('Vp_lp00', 'Vp_lplp', 'Vp_rprp', 'Vp_rk00B',
+                     'Jn_syalp00', 'Jn_t_slp00', 'Vp_syalk00', 'Vp_t_slk00',
+                     'Co_s_tlp00', 'Co_R_rp00L', 'Co_R_lp00R',
+                     'Co_R_crp00L', 'Co_R_clp00R')
+    } | {'Vp_9rkrp': ('Vp_energyA', 'Vp_energyB', 'Vp_energySP', 'Vp_hadohAB'),
+         'Vp_energyA': ('Vp_dash_EX',), 'Vp_energyB': ('Vp_dash_EX',)},
+    'secondary_string_followups': {'Vp_4lprp': ('Vp_4lprprk',)},
+    'free_meter_specials': True,
+    'noncontact_special_cancels': ('Vp_energyA', 'Vp_energyB'),
+    'buffered_special_cancels': True,
+    'buffered_special_timing': {
+        'extra_frames': 8,
+        'source_extra_frames': {'Vp_syalk00': 12, 'Vp_t_slk00': 12, 'Co_s_tlp00': 12},
+        'motion_window': 24,
+    },
+    'normal_string_followups': {'Vp_lp00': ('Vp_lplp', 'Vp_lprp')},
+
     'drop_moves': r'^Vp_Direct$',
     'direct': [(r'^Ju_sKAM00_$', 'move', ['Jn_sKAM00_']),                       # Jun's stance -> hers
                (r'^(ju|mk)_s', 'anim', ['vp_s%02d' % k for k in range(5)]),     # intros

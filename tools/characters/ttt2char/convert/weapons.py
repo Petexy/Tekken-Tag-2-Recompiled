@@ -157,7 +157,9 @@ def append_bones(skel, t7bones, weapon):
                 raise ValueError('weapon point slot %d (the slots are 0..%d)' % (slot, POINTS - 1))
         elif n >= POINT_FIRST + POINTS:
             raise ValueError('more than %d weapon points' % POINTS)
-        if isinstance(where, str):
+        if isinstance(where, dict):
+            x = world_t7[i][:3, 3] + np.asarray(where['world_offset'], dtype=float)
+        elif isinstance(where, str):
             x = world_t7[t7[where]][:3, 3]
         else:                                                      # cm along the weapon (Tekken 7's x)
             x = world_t7[i][:3, 3] + a[:, 0] * where * 10.0 * scale

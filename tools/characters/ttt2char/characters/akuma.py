@@ -62,7 +62,31 @@ VOICE_PREFIX = 'mx'
 # the id maps: Heihachi in both games, and his generic moves against TTT2's (Heihachi, the donor, Asuka)
 ALIGN = [('heihachi', 13), ('self', 13), ('heihachi', 14), ('self', DONOR_ROW), ('heihachi', 9), ('self', 23)]
 MOVESET = {
+    'bounds': {'Mx_3lprp2': True, 'Mx_66rk': True, 'Mx_3lrp': True},
+    'recovery_trim': {'Mx_3rplp': 4},
+    'startup_trim': {'Mx_3lrp': 4, 'Mx_66rk': 4},
     'name': '[AKUMA]',
+    # Keep Akuma's own WS2 and crouching punches rather than donor equivalents.
+    'own_moves': r'^Co_(s_trp00|t_slp00(?:y2?)?|t_srp00|t_slk00|syarp03|syalp00(?:y)?|syarp00)$',
+    'special_cancels': {
+        name: ('Ry_shoryu', 'Ry_shoryuB', 'Ry_tatumaki', 'Ry_tatumakiB',
+               'Ry_hadoh', 'Ry_hadohB', 'Mx_hyakiC', 'Mx_hyakiD')
+        for name in ('Mx_rp00', 'Mx_lp00', 'Mx_lplp', 'Mx_syalk00',
+                     'Co_s_trp00', 'Co_t_slp00', 'Co_t_srp00',
+                     'Co_syalp00', 'Co_syarp00', 'Co_t_slk00', 'Co_syarp03', 'Mx_4lp00', 'Mx_s_tlk00')
+    },
+    # Preserve T7's early motion capture and contact-time dispatch.
+    'buffered_special_cancels': True,
+    'buffered_special_timing': {
+        'extra_frames': 8,
+        'source_extra_frames': {'Co_s_trp00': 12, 'Mx_s_tlk00': 12, 'Co_t_slk00': 12, 'Mx_syalk00': 12},  # WS+2
+        'motion_window': 24,
+    },
+    'normal_string_followups': {
+        'Mx_lp00': ('Mx_lplp', 'Mx_lprp00'),
+        'Co_t_slp00': ('Co_syarp03',),
+        'Co_syalp00': ('Co_syarp03',),
+    },
     'drop_moves': r'^Mx_Direct$',
     'direct': [(r'^(la|mk)_s', 'anim', ['mx_s%02d' % k for k in range(6)]),     # the donor's intros -> his
                (r'^la_w', 'anim', ['mx_w%02d' % k for k in range(2)])],         # win poses

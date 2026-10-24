@@ -177,5 +177,33 @@ class Alignment(unittest.TestCase):
         self.assertIn(806, moveset.REQ_FALSE)
 
 
+
+class GroundedBackRolls(unittest.TestCase):
+    def converter(self):
+        import types
+        c=moveset.Converter.__new__(moveset.Converter)
+        d=Moveset();d.game='ttt2';d.aliases=[]
+        req=[dict(condition=69,param=0),dict(condition=690,param=0),dict(condition=690,param=0)]
+        def row(mid,rq):return dict(direction=16,button=0,move_id=mid,req=rq,extradata=0,win_start=1,win_end=32767,start_frame=1,option=0)
+        d.tables={'moves':[{}, {}, {}], 'requirements':req}
+        d.move_name=lambda i:['Co_AOzen','Co_AOkou','standing'][i]
+        c.d=d;c.T={'moves':[{}, {}, {}],'requirements':[dict(x) for x in req]}
+        c.ttt2_only_generic=set();c.stats=collections.Counter()
+        return c,row(0,0),row(1,2),dict(row(2,2),direction=M.LIST_END)
+
+    def test_missing_native_orientation_routes_are_restored(self):
+        c,conditional,fallback,end=self.converter()
+        original=[dict(end)]
+        result=c.merge_donor_extras(original,[conditional,fallback,end])
+        self.assertEqual(result,[conditional,fallback,end])
+        self.assertEqual(original,[end])
+        self.assertEqual(c.stats['native grounded back-roll routes restored'],2)
+
+    def test_existing_route_not_duplicated_and_conditional_stays_first(self):
+        c,conditional,fallback,end=self.converter()
+        result=c.merge_donor_extras([conditional,end],[conditional,fallback,end])
+        self.assertEqual(result,[conditional,fallback,end])
+        self.assertEqual(c.stats['native grounded back-roll routes restored'],1)
+
 if __name__ == '__main__':
     unittest.main()

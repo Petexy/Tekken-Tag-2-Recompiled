@@ -218,6 +218,14 @@ def _run(name, tekken7, movesets, game, out, log, make_shared, files):
     c = moveset.Converter(k, h7, motbin.read(archives.entry('data006', d.DONOR_ROW)),
                           archives.entry('data005', d.DONOR_ROW), motbin.read(archives.entry('data006', 13)),
                           archives.entry('data004', 0), maps, usage, place['row'], d)
+    if d.MOVESET.get('electric_tag_exit'):
+        c.electric_pack = archives.entry('data005', 13)
+    c.air_reaction_references = {spec[0]: motbin.read(archives.entry('data006', spec[0]))
+        for spec in d.MOVESET.get('air_reactions', {}).values() if isinstance(spec, tuple)}
+    if 'air_reaction_reference' in d.MOVESET:
+        c.air_reaction_reference = motbin.read(archives.entry('data006', d.MOVESET['air_reaction_reference']))
+    if d.MOVESET.get('stance_reference'):
+        c.stance_reference = motbin.read(archives.entry('data006', d.MOVESET['stance_reference'][0]))
     c.win_tones = wins
     c.shouts = sum(1 for mask, _ in vlist if mask & voice.KIAI) + len(voice_extra)
     c.opt_anims, c.part3 = opt_anims, part3

@@ -64,6 +64,7 @@ VOICE_PREFIX = 'kt'
 # the id maps: Heihachi in both games, and her generic moves against TTT2's (Heihachi, the donor, Asuka)
 ALIGN = [('heihachi', 13), ('self', 13), ('heihachi', 14), ('self', DONOR_ROW), ('heihachi', 9), ('self', 23)]
 MOVESET = {
+    'buffered_stance_transitions': {'Kt_rk00F': 'Kt_shoryu02'},
     'name': '[KUNIMITSU]',
     'drop_moves': r'^Kt_Direct$',
     'direct': [(r'^(ju|mk)_s', 'anim', ['kt_s%02d' % k for k in range(6)]),     # the donor's intros -> her

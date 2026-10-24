@@ -71,6 +71,8 @@ VOICE_PREFIX = 'mz'
 # the id maps: Heihachi in both games, and his generic moves against TTT2's (Heihachi, the donor, Asuka)
 ALIGN = [('heihachi', 13), ('self', 13), ('heihachi', 14), ('self', DONOR_ROW), ('heihachi', 9), ('self', 23)]
 MOVESET = {
+    'direct_buffered_strings': ('Mz_t_srk00F',),
+    'bounds': {'Mz_jpWPF': True, 'Mz_rk01jpWPF': True, 'Mz_t_srk02F': True, 'Mz_t_srk03F': False},
     'name': '[NOCTIS]',
     'drop_moves': r'^Mz_Direct$',
     'direct': [(r'^(la|mk)_s', 'anim', ['mz_s%02d' % k for k in range(5)]),     # the donor's intros -> his

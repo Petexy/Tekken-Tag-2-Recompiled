@@ -61,10 +61,26 @@ ART = {
 
 VOICE_PREFIX = 'nc'
 
+# An invisible hand point lowers b+1 collision by 40 mm; no drawn mesh.
+WEAPONS = [{'bone': 'L_Hand', 'parent': 'TE_L_jnt', 'pair': None,
+            'points': {0xfe: {'world_offset': (0, -40, 0)}}}]
+
 # the id maps: Heihachi in both games, and his generic moves against TTT2's (Heihachi, the donor, Asuka)
 ALIGN = [('heihachi', 13), ('self', 13), ('heihachi', 14), ('self', DONOR_ROW), ('heihachi', 9), ('self', 23)]
 MOVESET = {
+    'direct_buffered_strings': ('Nc_6lk',),
+    'hitboxes': {'Nc_lp00B': (0xfe, 0, 0xfe, 11)},
+    'air_reactions': {'Nc_lp00B': 'J8_jprk00',
+                      'Nc_66rklkrp': (23, 'Jn_mc03s')},
+    'tag_launchers': {'Nc_66rklkrp': 'La_Stormgear'},
+    'tag_launcher_air_only': ('Nc_66rklkrp',),
+    'electric_tag_exit': True,
+    'tag_exit_name': 'Fahkumram_Hellsweep_TagExit',
+    'air_reaction_reference': 40,  # Jinpachi u+4, airborne reaction
+    'bounds': {'Nc_66rklp': True, 'Nc_3rplp': True},
     'name': '[FAHKUMRAM]',
+    # Preserve Fahk's running 3 (ncss_mach) and d+4 (ncss_2rk), despite generic names.
+    'own_moves': r'^(Co_runlk00|Co_t_srk00)$',
     'drop_moves': r'^Nc_Direct$',
     'direct': [(r'^(la|mk)_s', 'anim', ['nc_s%02d' % k for k in range(4)]),     # the donor's intros -> his
                (r'^la_w', 'anim', ['nc_w%02d' % k for k in range(3)])],         # win poses
