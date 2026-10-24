@@ -1,4 +1,5 @@
 #include "title/roster.h"
+#include "outfit_menu.h"
 
 #include "cafe/ppc_ops.h"
 #include "cafe/runtime.h"
@@ -18,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <set>
@@ -197,6 +199,10 @@ struct Weapon {
 };
 
 // The added fighters, by number k (their slots).
+struct Outfit {
+    std::string code;
+    uint32_t id = 0, code_string = 0;
+};
 struct Added {
     bool active = false;
     uint32_t id = 0, records[2] = {0, 0}, row = 0;
@@ -209,8 +215,19 @@ struct Added {
     uint32_t code_string = 0;       // the code as a guest string
     fs::path pack;
     std::vector<Weapon> weapons;
+    std::vector<Outfit> outfits;
 };
 std::vector<Added> g_added;
+std::map<uint32_t, int> g_outfit_ids;
+// These are private 32-bit keys in the chara master's map, not fighter IDs.
+// Code lookup normalizes them before the command parser sees them, and the
+// body recipe always retains the base fighter ID. Never put these keys in
+// byte-sized player/selection fields. Native registration stores them as u32
+// (06686418); this separate space can hold the whole imported roster.
+constexpr uint32_t kFirstOutfitId = 0x10000, kOutfitIdEnd = kFirstOutfitId + 128 * 14;
+uint32_t g_outfit_picks[2][2] = {};
+outfit_menu::BodySelections g_outfit_bodies;
+uint32_t g_outfit_cursor = 0, g_outfit_choice = 0;
 bool g_active = false; // any
 
 // An added fighter's voice.
@@ -234,6 +251,8 @@ uint32_t g_sound_table = 0, g_sound_count = 0; // the extended sound table (0: t
 
 // The slot of the added fighter with select id `id`, or -1.
 int slot_of_id(uint32_t id) {
+    if (const auto it = g_outfit_ids.find(id); it != g_outfit_ids.end())
+        return g_added[it->second].active ? it->second : -1;
     if (id < kFirstAddedId || id - kFirstAddedId >= g_added.size()) return -1;
     return g_added[id - kFirstAddedId].active ? static_cast<int>(id - kFirstAddedId) : -1;
 }
@@ -314,6 +333,7 @@ std::optional<uint32_t> part_key(const std::string& path, const std::string& cod
 constexpr int kPackFormat = 1;
 // Added fighters' places: 0 to 127 (the importer's pack.MAX_FIGHTERS).
 constexpr int kMaxFighters = 128;
+static_assert(kFirstAddedId + kMaxFighters <= kFirstOutfitId);
 
 struct Pack {
     fs::path directory;
@@ -325,6 +345,7 @@ struct Pack {
     uint32_t chr_tones = 0; // its voice bank's shouts (the win quotes' tones come after; 0: no merged bank)
     std::vector<uint32_t> voice_extra; // its bank's shouts past the donor's (appended to the voice list)
     std::vector<Weapon> weapons;       // character.ini weapons: k:parent:points[:summon] (see pose_weapons)
+    std::vector<std::string> outfits;  // optional complete body sets, in chooser order
 };
 
 fs::path packs_directory() {
@@ -373,7 +394,10 @@ std::optional<Pack> read_pack(const fs::path& directory) {
         else if (key == "sex") pack.female = value != "male";
         else if (key == "slot") pack.slot = ini_number(value).value_or(-1);
         else if (key == "chr_tones") pack.chr_tones = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 10));
-        else if (key == "voice_extra") {
+        else if (key == "outfits") {
+            std::istringstream names(value);
+            for (std::string code; names >> code;) pack.outfits.push_back(code);
+        } else if (key == "voice_extra") {
             std::istringstream tones(value);
             for (uint32_t tone; tones >> tone;) pack.voice_extra.push_back(tone);
         } else if (key == "weapons") { // k:parent:points[:summon], points n or n>slot, e.g. 1:9:0,1,2 or 4:9:0>0,1>1:3
@@ -409,6 +433,27 @@ std::optional<Pack> read_pack(const fs::path& directory) {
         return std::nullopt;
     }
     std::error_code ec;
+    if (!pack.outfits.empty()) {
+        std::set<std::string> unique;
+        bool valid = pack.outfits.size() <= outfit_menu::kMaxPresets;
+        for (const auto& code : pack.outfits) {
+            valid = valid && code.size() == 3 && code != pack.code &&
+                    std::all_of(code.begin(), code.end(), [](char c) { return c >= 'a' && c <= 'z'; }) &&
+                    unique.insert(code).second;
+            for (const char* ext : {".nud", ".nut", ".bon", ".xml", ".mop"})
+                valid = valid && fs::is_regular_file(directory / (code + ext), ec);
+        }
+        std::ifstream previews(directory / "art/costumes.nut", std::ios::binary);
+        std::array<unsigned char, 8> header{};
+        valid = valid && static_cast<bool>(previews.read(reinterpret_cast<char*>(header.data()), header.size())) &&
+                std::memcmp(header.data(), "NTP3", 4) == 0 &&
+                ((static_cast<size_t>(header[6]) << 8) | header[7]) == pack.outfits.size();
+        if (!valid) {
+            std::fprintf(stderr, "ttt2: warning: %s: invalid/incomplete outfit sets; using the default costume\n",
+                         directory.c_str());
+            pack.outfits.clear();
+        }
+    }
     if (!has_format) pack.format = fs::is_directory(directory / "keys", ec) ? 0 : 1;
     return pack;
 }
@@ -590,6 +635,8 @@ bool add_entries(const Pack& pack, uint32_t donor_row, size_t slot) {
     std::vector<File> files;
     for (const char* suffix : kBodySuffixes) {
         files.push_back({pack.code + suffix, key_of(pack.code + suffix), key_of(pack.donor + suffix)});
+        for (const auto& outfit : pack.outfits)
+            files.push_back({outfit + suffix, key_of(outfit + suffix), key_of(pack.donor + suffix)});
     }
     files.push_back({pack.code + kMovelistName, key_of(pack.code + kMovelistName), key_of(pack.donor + kMovelistName)});
     files.push_back({pack.code + kMotionName, key_of(pack.code + kMotionName), load(kMotionRows + 12 * donor_row)});
@@ -609,7 +656,9 @@ bool add_entries(const Pack& pack, uint32_t donor_row, size_t slot) {
             auto contents = archive::unpack(donor->first, f.donor_key);
             if (!contents) return false;
             entries[key] = archive::pack(*contents, key, flags);
-        } else if (f.name != pack.code + ".mop" && f.name != pack.code + ".havok.xml") {
+        } else if (f.name.size() < 4 ||
+                   (f.name.compare(f.name.size() - 4, 4, ".mop") != 0 &&
+                    (f.name.size() < 10 || f.name.compare(f.name.size() - 10, 10, ".havok.xml") != 0))) {
             std::fprintf(stderr, "ttt2: warning: neither %s nor its donor has %s\n", pack.directory.c_str(),
                          f.name.c_str());
             return false;
@@ -652,6 +701,12 @@ bool add_entries(const Pack& pack, uint32_t donor_row, size_t slot) {
         const uint32_t key = part_key(name, pack.code).value_or(key_of(entry));
         uint8_t flags[8] = {};
         entries[key] = archive::pack(*contents, key, flags);
+        if (name.compare(0, 4, "alo/") == 0) {
+            for (const auto& outfit : pack.outfits) {
+                const uint32_t alias_key = key_of(outfit + "/" + name);
+                entries[alias_key] = archive::pack(*contents, alias_key, flags);
+            }
+        }
     }
     if (!vfs::set_archive_entries("content/hdd/data100", entries)) return false;
     for (const std::string& failed : serve_raw(raw, pack.directory)) {
@@ -1059,10 +1114,11 @@ void prepare_art(const Pack& pack, size_t slot, const fs::path& shared) {
 // select id: 59 rows, none for an added fighter) with a picture each, from a
 // texture container whose key is in kCostumePreviews (59 keys by select id;
 // the added fighters' places are past the table, in a string the title does
-// not read there), then five customisation slots. An added fighter has one
-// costume: its list is the donor's first costume (costume 1), its pictures
-// the pack's (`<code>/` + kCostumeFile, else the donor's), its key lent to the
-// table's place only while the chooser's functions run, and the chooser
+// not read there), then five customisation slots. An added fighter normally
+// has one costume. Optional complete outfit bodies repeat the donor's first
+// equipment set, with one preview each; the pick chooses a separate body code.
+// Its pictures are the pack's (`<code>/` + kCostumeFile, else the donor's),
+// its key lent to the table only while the chooser's functions run. The chooser
 // leaves out the customisation slots (customisation is made per fighter in a
 // mode an added fighter is not in; loading a slot's items would read past
 // tables).
@@ -1071,9 +1127,9 @@ constexpr const char* kCostumeFile = "art/costumes.nut";
 constexpr uint32_t kCostumeOne = 0;                          // the type of costume 1 in a list
 constexpr uint32_t kChooserPending = 324, kChooserCount = 88, kChooserEntries = 92, kChooserEntrySize = 16;
 constexpr uint32_t kChooserSlot = 5;                         // an entry's kind: a customisation slot
-// An added fighter's costume list (one entry {type, u16 value, u16 0}) and the key of its pictures.
+// Each list entry is {type, u16 value, u16 0}; pictures use the same order.
 struct Costume {
-    uint32_t entries = 0, key = 0;
+    uint32_t entries = 0, key = 0, count = 1;
 };
 std::vector<Costume> g_costumes;
 
@@ -1084,14 +1140,18 @@ void prepare_costumes(const Pack& pack, uint32_t donor, size_t slot) {
                                                                          : load(kCostumePreviews + 4 * donor);
     // the donor's costume 1 (its first entry of that type), else a costume 1 of no value
     const uint32_t entries = load(kCostumeLists + 8 * donor), count = load(kCostumeLists + 8 * donor + 4);
-    costume.entries = system_alloc(8);
-    store(costume.entries, kCostumeOne);
-    store(costume.entries + 4, 0);
+    costume.count = std::max<size_t>(1, pack.outfits.size());
+    costume.entries = system_alloc(8 * costume.count);
+    uint32_t value = 0;
     for (uint32_t i = 0; i < count; ++i) {
         if (load(entries + 8 * i) == kCostumeOne) {
-            store(costume.entries + 4, load(entries + 8 * i + 4));
+            value = load(entries + 8 * i + 4);
             break;
         }
+    }
+    for (uint32_t i = 0; i < costume.count; ++i) {
+        store(costume.entries + 8 * i, kCostumeOne);
+        store(costume.entries + 8 * i + 4, value);
     }
 }
 
@@ -1194,13 +1254,25 @@ void prepare_roster() {
                          pack.directory.c_str(), kMaxFighters);
         }
     }
+    outfit_menu::CodeOwners codes;
+    for (size_t k = 0; k < at.size(); ++k) {
+        if (!at[k] || at[k]->format != kPackFormat) continue;
+        codes.add(k, at[k]->code);
+        for (const auto& code : at[k]->outfits) codes.add(k, code);
+    }
     g_added.assign(at.size(), Added{});
+    g_outfit_ids.clear();
     g_voice.assign(at.size(), Voice{});
     g_art.assign(at.size(), Art{});
     g_costumes.assign(at.size(), Costume{});
     for (size_t k = 0; k < at.size(); ++k) {
         if (!at[k]) continue;
         const Pack& pack = *at[k];
+        if (codes.conflicts(k)) {
+            std::fprintf(stderr, "ttt2: warning: %s: duplicate fighter/outfit code; skipped\n",
+                         pack.directory.c_str());
+            continue;
+        }
         if (pack.format < kPackFormat) {
             std::fprintf(stderr,
                          "ttt2: warning: %s was made by an older importer (pack format %d, this game loads %d): add "
@@ -1240,6 +1312,28 @@ void prepare_roster() {
         added.code = pack.code;
         added.pack = pack.directory;
         added.weapons = pack.weapons;
+        for (size_t i = 0; i < pack.outfits.size(); ++i) {
+            const auto& code = pack.outfits[i];
+            if (fighter_id(code) || std::any_of(g_added.begin(), g_added.end(), [&](const Added& a) {
+                    return a.code == code || std::any_of(a.outfits.begin(), a.outfits.end(),
+                        [&](const Outfit& outfit) { return outfit.code == code; });
+                })) {
+                std::fprintf(stderr, "ttt2: warning: duplicate outfit code %s; skipping %s\n",
+                             code.c_str(), pack.code.c_str());
+                added.outfits.clear();
+                break;
+            }
+            // Registry-only identities. They resolve to the base fighter in all roster hooks;
+            // the player itself is restored to the base select id after loadPlayer.
+            const uint32_t id = kFirstOutfitId + static_cast<uint32_t>(g_outfit_ids.size());
+            if (id >= kOutfitIdEnd) {
+                std::fprintf(stderr, "ttt2: warning: no outfit registry identity left for %s\n", code.c_str());
+                break;
+            }
+            added.outfits.push_back({code, id, guest_string(code)});
+            g_outfit_ids[id] = static_cast<int>(k);
+        }
+        if (added.outfits.size() != pack.outfits.size()) continue;
         if (!add_entries(pack, *donor_row, k)) {
             std::fprintf(stderr, "ttt2: warning: %s could not be added\n", pack.directory.c_str());
             continue;
@@ -1264,6 +1358,26 @@ void prepare_roster() {
     add_shared(directory / "shared");
     patch_sounds();
     place_cells();
+    if (std::getenv("TTT2_TRACE_ROSTER") && !std::getenv("TTT2_INPUT_SCRIPT")) {
+        std::map<uint32_t, std::string> names;
+        for (const auto& fighter : g_added) {
+            if (!fighter.active || fighter.outfits.empty()) continue;
+            for (const auto* suffix : kBodySuffixes) {
+                names[key_of(fighter.code + suffix)] = fighter.code + suffix;
+                for (const auto& outfit : fighter.outfits)
+                    names[key_of(outfit.code + suffix)] = outfit.code + suffix;
+            }
+        }
+        vfs::watch_entry_reads([names = std::move(names)](uint32_t key) {
+            const auto found = names.find(key);
+            if (found == names.end()) return;
+            static std::mutex mutex;
+            static std::set<uint32_t> seen;
+            std::lock_guard lock(mutex);
+            if (seen.insert(key).second)
+                std::fprintf(stderr, "ttt2: outfit: read body file %s\n", found->second.c_str());
+        });
+    }
 }
 
 } // namespace cafe::title
@@ -1306,48 +1420,127 @@ PPC_FUNC(sub_065DFA4C); // the chara master's strings: init(this)
 PPC_FUNC(sub_065E8604); // assign(this, char*)
 PPC_FUNC(sub_065E52A4); // destroy(this, 0)
 PPC_FUNC(sub_06685CB8); // chara master: add(this, id, row, &name, &code)
+PPC_FUNC(sub_0209506C); // chara master: find(this, tuple*, string*) by body code
+PPC_FUNC(sub_0209506C_orig);
+PPC_FUNC(sub_0209506C) {
+    const uint32_t result = ctx.r[4];
+    sub_0209506C_orig(ctx, base);
+    if (!ctx.r[3]) return;
+    // Registry-only outfit keys distinguish body codes in the chara master.
+    // They are not player identities: loadPlayer indexes its model cache by
+    // the returned tuple's id (020A0488), while the player uses the base id.
+    // Keep the outfit code and row, but attach its body to the actual fighter.
+    const auto it = g_outfit_ids.find(load(result));
+    if (it == g_outfit_ids.end()) return;
+    const Added& fighter = g_added[it->second];
+    if (!fighter.active) return;
+    const uint32_t alias = load(result);
+    store(result, fighter.id);
+    if (std::getenv("TTT2_TRACE_ROSTER"))
+        std::fprintf(stderr, "ttt2: outfit: resolved body identity %u to fighter %u, row %u\n",
+                     alias, fighter.id, load(result + 4));
+}
+
+// The command parser indexes its recipe cache with the fighter id, then
+// initializes the cached recipe from the master entry found by that id.
+// That second lookup has already discarded the outfit code. Keep its gameplay
+// identity, but supply the selected body's strings to the recipe initializer.
+PPC_FUNC(sub_02091898_orig);
+PPC_FUNC(sub_02091898) {
+    const uint32_t recipe = ctx.r[3], tuple = ctx.r[4], slot = load(recipe + 20);
+    const uint32_t body_id = g_outfit_bodies.resolve(slot, load(tuple));
+    const int k = body_id ? slot_of_id(body_id) : -1;
+    const Outfit* selected = nullptr;
+    if (k >= 0 && outfit_menu::matches_fighter(load(tuple), g_added[k].id) &&
+        !g_added[k].outfits.empty()) {
+        for (const auto& outfit : g_added[k].outfits)
+            if (outfit.id == body_id) selected = &outfit;
+    }
+    const uint32_t fighter_id = load(tuple);
+    if (selected) {
+        // All fighter codes/names here are inline three-byte strings. Use a
+        // private tuple so the shared master entry keeps its base identity.
+        static const uint32_t body = system_alloc(72);
+        std::memcpy(guest_pointer(body), guest_pointer(tuple), 72);
+        store(body, g_added[k].id);
+        store(body + 4, g_added[k].row);
+        guest_call(ctx, base, sub_065E8604, {body + 8, selected->code_string});
+        guest_call(ctx, base, sub_065E8604, {body + 40, selected->code_string});
+        ctx.r[4] = body;
+    }
+    sub_02091898_orig(ctx, base);
+    if (selected) {
+        if (std::getenv("TTT2_TRACE_ROSTER"))
+            std::fprintf(stderr, "ttt2: outfit: slot %u body recipe %s (registry %u), incoming fighter %u, stored fighter %u\n",
+                         slot, selected->code.c_str(), selected->id, fighter_id, load(recipe + 24));
+    }
+}
 
 void register_added(PPCContext& ctx, uint8_t* base) {
     static const uint32_t scratch = system_alloc(128);
     const uint32_t code = scratch, key = scratch + 32, name = scratch + 64, text = scratch + 96;
-    for (const Added& added : g_added) {
-        if (!added.active) continue;
-        const uint32_t registry = load(kRegistry);
-        guest_call(ctx, base, sub_06640368, {code, added.code_string});
-        guest_call(ctx, base, sub_0663F888, {registry, code});
-        // types 0-4: <code>.nud .nut .bon .mop .havok.xml; 6: <code>.xml
-        const char* files[] = {".nud", ".nut", ".bon", ".mop", ".havok.xml"};
-        for (uint32_t t = 0; t < 5; ++t) {
-            store(key, key_of(added.code + files[t]));
-            guest_call(ctx, base, sub_0663B054, {registry, code, t, key});
+    for (const Added& original : g_added) {
+        if (!original.active) continue;
+        std::vector<Added> bodies{original};
+        for (const auto& outfit : original.outfits) {
+            Added body = original;
+            body.code = outfit.code;
+            body.code_string = outfit.code_string;
+            body.id = outfit.id;
+            bodies.push_back(std::move(body));
         }
-        // 6 the item database, 7-9 and 11 the part packs (model, texture, bone, mop), 12 the bone pack again,
-        // 15 the texture pack again, 10 and 13 keys nothing has
-        const std::pair<uint32_t, uint32_t> keys[] = {
-            {6, key_of(added.code + ".xml")}, {7, part_pack(added.code, 0)}, {8, part_pack(added.code, 1)},
-            {9, part_pack(added.code, 2)}, {10, key_of(added.code + "/10")}, {11, part_pack(added.code, 3)},
-            {13, key_of(added.code + "/13")}, {15, part_pack(added.code, 1)}, {12, part_pack(added.code, 2)}};
-        for (const auto& [t, k] : keys) {
-            store(key, k);
-            guest_call(ctx, base, sub_0663C34C, {registry, code, t, key});
+        for (const Added& added : bodies) {
+            const uint32_t registry = load(kRegistry);
+            guest_call(ctx, base, sub_06640368, {code, added.code_string});
+            guest_call(ctx, base, sub_0663F888, {registry, code});
+            // types 0-4: <code>.nud .nut .bon .mop .havok.xml; 6: <code>.xml
+            const char* files[] = {".nud", ".nut", ".bon", ".mop", ".havok.xml"};
+            for (uint32_t t = 0; t < 5; ++t) {
+                store(key, key_of(added.code + files[t]));
+                guest_call(ctx, base, sub_0663B054, {registry, code, t, key});
+            }
+            // 6 the item database, 7-9 and 11 the part packs (model, texture, bone, mop), 12 the bone pack again,
+            // 15 the texture pack again, 10 and 13 keys nothing has
+            const std::pair<uint32_t, uint32_t> keys[] = {
+                {6, key_of(added.code + ".xml")}, {7, part_pack(original.code, 0)}, {8, part_pack(original.code, 1)},
+                {9, part_pack(original.code, 2)}, {10, key_of(added.code + "/10")}, {11, part_pack(original.code, 3)},
+                {13, key_of(added.code + "/13")}, {15, part_pack(original.code, 1)}, {12, part_pack(original.code, 2)}};
+            for (const auto& [t, k] : keys) {
+                store(key, k);
+                guest_call(ctx, base, sub_0663C34C, {registry, code, t, key});
+            }
+            for (uint32_t i = 0; i < 20; ++i) {
+                store(key, key_of(added.code + "/14/" + std::to_string(i)));
+                guest_call(ctx, base, sub_0663D644, {registry, code, 14, key, i});
+            }
+            guest_call(ctx, base, sub_0661CF78, {code, 0});
+            guest_call(ctx, base, sub_0663F7C8, {code, 0});
+            // the chara master's record
+            const uint32_t master = load(kCharaMaster);
+            std::memcpy(guest_pointer(text), added.code.c_str(), 4);
+            guest_call(ctx, base, sub_065DFA4C, {name});
+            guest_call(ctx, base, sub_065E8604, {name, text});
+            guest_call(ctx, base, sub_065DFA4C, {code});
+            guest_call(ctx, base, sub_065E8604, {code, added.code_string});
+            guest_call(ctx, base, sub_06685CB8, {master, added.id, added.row, name, code});
+            if (added.code != original.code && std::getenv("TTT2_TRACE_ROSTER")) {
+                static const uint32_t found = system_alloc(80);
+                guest_call(ctx, base, sub_065DFA4C, {found + 8});
+                guest_call(ctx, base, sub_065DFA4C, {found + 40});
+                const uint32_t ok = guest_call(ctx, base, sub_0209506C, {master, found, code});
+                std::fprintf(stderr, "ttt2: outfit: native lookup %s: %u, identity %u, motion row %u\n",
+                             added.code.c_str(), ok, load(found), load(found + 4));
+                guest_call(ctx, base, sub_065E52A4, {found + 8, 0});
+                guest_call(ctx, base, sub_065E52A4, {found + 40, 0});
+            }
+            guest_call(ctx, base, sub_065E52A4, {name, 0});
+            guest_call(ctx, base, sub_065E52A4, {code, 0});
+            if (added.code != original.code && std::getenv("TTT2_TRACE_ROSTER"))
+                std::fprintf(stderr, "ttt2: outfit: registered %s for %s, identity %u, motion row %u\n",
+                             added.code.c_str(), original.code.c_str(), added.id, added.row);
         }
-        for (uint32_t i = 0; i < 20; ++i) {
-            store(key, key_of(added.code + "/14/" + std::to_string(i)));
-            guest_call(ctx, base, sub_0663D644, {registry, code, 14, key, i});
-        }
-        guest_call(ctx, base, sub_0661CF78, {code, 0});
-        guest_call(ctx, base, sub_0663F7C8, {code, 0});
-        // the chara master's record
-        const uint32_t master = load(kCharaMaster);
-        std::memcpy(guest_pointer(text), added.code.c_str(), 4);
-        guest_call(ctx, base, sub_065DFA4C, {name});
-        guest_call(ctx, base, sub_065E8604, {name, text});
-        guest_call(ctx, base, sub_065DFA4C, {code});
-        guest_call(ctx, base, sub_065E8604, {code, added.code_string});
-        guest_call(ctx, base, sub_06685CB8, {master, added.id, added.row, name, code});
-        guest_call(ctx, base, sub_065E52A4, {name, 0});
-        guest_call(ctx, base, sub_065E52A4, {code, 0});
     }
+
 }
 
 PPC_FUNC(sub_065C3128_orig);
@@ -1472,20 +1665,61 @@ PPC_FUNC(sub_033D52B4) {
 // r4, record r5): the code from the code table by select id, refused for ids
 // from 63 on. For an added fighter's record it runs with a proxy: Paul's id
 // for the record and the added fighter's code in Paul's place of the code
-// table, then the player gets the added fighter's id.
+// table, then the player gets the added fighter's id. A selected outfit has
+// its own code/registry identity, keeping asynchronous loads of mirror outfits
+// separate; it shares the base fighter's motion row and all roster hooks.
 PPC_FUNC(sub_05C5EF74); // the player of a slot
 PPC_FUNC(sub_044BE1EC_orig);
 PPC_FUNC(sub_044BE1EC) {
     const int k = slot_of_record(ctx.r[5]);
     if (k < 0) {
+        g_outfit_bodies.remember(ctx.r[4], 0, 0);
         sub_044BE1EC_orig(ctx, base);
         return;
     }
-    const uint32_t slot = ctx.r[4], paul_code = load(kCodes);
-    store(kCodes, g_added[k].code_string);
+    const uint32_t loader = ctx.r[3], slot = ctx.r[4], record = ctx.r[5], paul_code = load(kCodes);
+    uint32_t code_string = g_added[k].code_string;
+    g_outfit_bodies.remember(slot, g_added[k].id, 0);
+    // Native loader slots are side + 2 * member (the mode manager uses the same ordering).
+    if (slot < 4 && !g_added[k].outfits.empty()) {
+        const size_t outfit = g_outfit_picks[slot & 1][slot / 2];
+        if (outfit < g_added[k].outfits.size()) {
+            code_string = g_added[k].outfits[outfit].code_string;
+            g_outfit_bodies.remember(slot, g_added[k].id, g_added[k].outfits[outfit].id);
+        }
+    }
+    // The native cache compares records only. Different outfits deliberately
+    // share a record, so invalidate a completed body's cache on a code change.
+    // 139 is its native empty-record sentinel (also used by sub_044BDF98).
+    static std::map<std::pair<uint32_t, uint32_t>, uint32_t> requested_codes;
+    const auto request_key = std::make_pair(loader, slot);
+    const uint32_t state = loader + 28 + 56 * slot;
+    const bool invalidate = slot < 5 && !g_added[k].outfits.empty() &&
+        outfit_menu::needs_reload(requested_codes[request_key], code_string, load8(state + 1) != 0,
+                                  load(state + 12), record);
+    if (invalidate) store(state + 12, 139);
+    store(kCodes, code_string);
     g_proxy_record = static_cast<int>(ctx.r[5]);
     g_proxy_id = 0;
     sub_044BE1EC_orig(ctx, base);
+    if (slot < 5 && !g_added[k].outfits.empty()) {
+        if (ctx.r[3] != 0) requested_codes[request_key] = code_string;
+        else if (invalidate && !load8(state + 1)) store(state + 12, record);
+    }
+    if (!g_added[k].outfits.empty() && slot < 5 && std::getenv("TTT2_TRACE_ROSTER")) {
+        // The loader retries while asynchronous work completes. Log transitions,
+        // not every poll, so a stalled load leaves a useful, bounded trace.
+        const uint32_t state = loader + 28 + 56 * slot;
+        const std::array<uint32_t, 6> now = {code_string, record, ctx.r[3], load8(state + 1),
+                                           load(state + 8), load(state + 12)};
+        static std::map<std::pair<uint32_t, uint32_t>, std::array<uint32_t, 6>> previous;
+        const auto key = std::make_pair(loader, slot);
+        if (previous.find(key) == previous.end() || previous[key] != now) {
+            previous[key] = now;
+            std::fprintf(stderr, "ttt2: outfit: slot %u model %s: accepted=%u pending=%u requested=%u current=%u\n",
+                         slot, reinterpret_cast<const char*>(guest_pointer(code_string)), now[2], now[3], now[4], now[5]);
+        }
+    }
     g_proxy_record = -1;
     store(kCodes, paul_code);
     if (const uint32_t player = guest_call(ctx, base, sub_05C5EF74, {slot})) store(player + kPlayerSelectId, g_added[k].id);
@@ -1598,7 +1832,11 @@ PPC_FUNC(sub_033E2530) {
     } else if (g_lent >= 0 && guest_call(ctx, base, sub_033D50A8, {record}) == static_cast<uint32_t>(g_lent)) {
         g_lent_bit = false; // TTT2 fighter k picked while the bit was lent
     }
-    if (number < 2 && member < 2) g_picks[number][member] = k >= 0 ? g_added[k].id : 0;
+    if (number < 2 && member < 2) {
+        g_picks[number][member] = k >= 0 ? g_added[k].id : 0;
+        const uint32_t outfit = g_outfit_cursor == player ? g_outfit_choice : 0;
+        g_outfit_picks[number][member] = k >= 0 && outfit < g_added[k].outfits.size() ? outfit : 0;
+    }
     fix_side_ids();
 }
 // A player's side (sides r3, player r4; a thunk to sub_03800838), as the
@@ -2638,7 +2876,7 @@ PPC_FUNC(sub_0580D690) {
     }
     const uint32_t paul[2] = {load(kCostumeLists), load(kCostumeLists + 4)};
     store(kCostumeLists, g_costumes[k].entries);
-    store(kCostumeLists + 4, 1);
+    store(kCostumeLists + 4, g_costumes[k].count);
     ctx.r[4] = 0;
     sub_0580D690_orig(ctx, base);
     store(kCostumeLists, paul[0]);
@@ -2681,6 +2919,16 @@ PPC_FUNC(sub_033E265C_orig);
 PPC_FUNC(sub_033E265C) {
     const uint32_t cursor = ctx.r[4];
     const int k = slot_of_id(ctx.r[7]);
+    const uint32_t old_cursor = g_outfit_cursor, old_choice = g_outfit_choice;
+    g_outfit_cursor = cursor;
+    g_outfit_choice = k >= 0 && ctx.r[8] > 0 && ctx.r[8] <= g_added[k].outfits.size() ? ctx.r[8] - 1 : 0;
+    // Opening and confirming use this same function. Only confirmation may
+    // substitute the native equipment style; opening must keep its input.
+    ctx.r[8] = outfit_menu::native_style(k >= 0 ? g_added[k].outfits.size() : 0, ctx.lr, ctx.r[8]);
+    if (k >= 0 && !g_added[k].outfits.empty() && outfit_menu::confirming(ctx.lr) &&
+        std::getenv("TTT2_TRACE_ROSTER"))
+        std::fprintf(stderr, "ttt2: outfit: confirmed menu entry %u for %s\n",
+                     g_outfit_choice + 1, g_added[k].code.c_str());
     const bool lend = k >= 0 && k < 32 && cursor != 0 && g_lent < 0;
     if (lend) {
         g_lent = k;
@@ -2689,6 +2937,8 @@ PPC_FUNC(sub_033E265C) {
     }
     lend_costume_keys(true);
     sub_033E265C_orig(ctx, base);
+    g_outfit_cursor = old_cursor;
+    g_outfit_choice = old_choice;
     lend_costume_keys(false);
     if (lend) {
         set_mask_bit(cursor, static_cast<uint32_t>(k), g_lent_bit);
@@ -2721,6 +2971,9 @@ PPC_FUNC(sub_033E3460) {
     uint32_t kept = 0;
     while (kept < count && load(cursor + kChooserEntries + kChooserEntrySize * kept) != kChooserSlot) ++kept;
     store8(cursor + kChooserCount, static_cast<uint8_t>(kept));
+    if (!g_added[k].outfits.empty() && std::getenv("TTT2_TRACE_ROSTER"))
+        std::fprintf(stderr, "ttt2: outfit: costume chooser built %u entries for %s\n",
+                     kept, g_added[k].code.c_str());
 }
 
 // ------------------------------------------------------------------ extra bones (see kPlayerAnimator)

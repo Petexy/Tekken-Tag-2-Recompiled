@@ -12,6 +12,17 @@ TEKKEN7_CODE = 'mry'
 CODE = 'mry'
 SEX = 'male'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('houou', 'Houou'),
+    ('houou_c1', 'Houou c1'),
+    ('houou_silver', 'Houou silver'),
+    ('suit_gilet', 'Suit gilet'),
+)
+
 DONOR = 'lar'                 # Lars Alexandersson: a slim male skeleton
 DONOR_ROW = 38
 

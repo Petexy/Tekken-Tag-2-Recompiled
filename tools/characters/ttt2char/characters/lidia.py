@@ -11,6 +11,17 @@ TEKKEN7_CODE = 'nsd'
 CODE = 'nsd'
 SEX = 'female'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('chic', 'Chic'),
+    ('chic_c1', 'Chic c1'),
+    ('vip', 'Vip'),
+    ('vip_silver', 'Vip silver'),
+)
+
 DONOR = 'jun'                 # Jun Kazama: the 139-bone female skeleton
 DONOR_ROW = 42
 

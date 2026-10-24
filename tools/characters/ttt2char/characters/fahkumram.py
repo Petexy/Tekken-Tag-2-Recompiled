@@ -11,6 +11,17 @@ TEKKEN7_CODE = 'nsc'
 CODE = 'nsc'
 SEX = 'male'
 
+# Ordered entries for the in-game preset chooser (asset names, never game data).
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1P_c1', 'Default alternate'),
+    ('Champ', 'Champion'),
+    ('Champ_silver', 'Champion silver'),
+    ('trad_royal', 'Royal'),
+    ('trad_royal_c1', 'Royal alternate'),
+)
+
 DONOR = 'lar'                 # Lars Alexandersson: a slim male skeleton
 DONOR_ROW = 38
 

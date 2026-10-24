@@ -11,6 +11,14 @@ TEKKEN7_CODE = 'nsa'
 CODE = 'nsa'
 SEX = 'male'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('s9', 'S9'),
+    ('s9_cleanprisoner', 'S9 cleanprisoner'),
+)
+
 DONOR = 'lar'                 # Lars Alexandersson: a slim male skeleton
 DONOR_ROW = 38
 

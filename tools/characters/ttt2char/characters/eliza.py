@@ -12,6 +12,18 @@ TEKKEN7_CODE = 'elz'          # her code in Tekken 7's files (AkBankVoiceELZ.bnk
 CODE = 'elz'                  # her three-letter code in the pack (not a code TTT2 already has)
 SEX = 'female'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('bikini_big', 'Bikini big'),
+    ('goth', 'Goth'),
+    ('goth_c1', 'Goth c1'),
+    ('vampire', 'Vampire'),
+    ('vampire_silver', 'Vampire silver'),
+)
+
 DONOR = 'jun'                 # Jun Kazama: the 139-bone female skeleton
 DONOR_ROW = 42                # Jun's motion row (data005 / data006 entry)
 

@@ -18,6 +18,9 @@ $XDG_DATA_HOME/ttt2/characters, else ~/.local/share/ttt2/characters, as the port
     art/                       its pictures for the loading and VS screens and the costume chooser (the port shows
                                its art when the pack has this folder)
     colours.json               its player 2 colours (palette number: 1P and 2P colour), for shared/
+    <outfit>.nud .nut .bon     optional complete preset bodies, with matching .xml and .mop;
+                               character.ini outfits lists their three-letter codes in preview order
+                               (up to fourteen). art/costumes.nut then has one texture per preset.
 The packs share `shared/keys/` (made for all of them together, shared.py): changed copies of the title's own entries
 (2D layouts with every added fighter's pictures, the big portraits' container, the costume palettes and colour grid,
 the select screen's name calls; `<key>.bin`) and texture pages to add to its texture containers (`<key>.add`).
@@ -172,7 +175,7 @@ def remove_shared(folder):
         delete_path(path)
 
 
-def character_ini(d, slot, chr_tones=0, voice_extra=(), weapons=()):
+def character_ini(d, slot, chr_tones=0, voice_extra=(), weapons=(), outfits=()):
     """voice_extra: the se_Chr tones of the shouts past the donor's (the port appends them to the voice list);
     weapons: weapons.of_skeleton's [(k, parent bone, [(point number, slot)], summon)] (the port poses them):
     k:parent:points[:summon], a point `n` hitting as slot n, else `n>slot`."""
@@ -183,7 +186,8 @@ def character_ini(d, slot, chr_tones=0, voice_extra=(), weapons=()):
             'format = %d\ncode = %s\ndonor = %s\nsex = %s\nslot = %d\nchr_tones = %d\n'
             % (d.NAME.split(' (')[0], PACK_FORMAT, d.CODE, d.DONOR, d.SEX, slot, chr_tones)
             + ('voice_extra = %s\n' % ' '.join(map(str, voice_extra)) if voice_extra else '')
-            + ('weapons = %s\n' % ' '.join(item(*w) for w in weapons) if weapons else ''))
+            + ('weapons = %s\n' % ' '.join(item(*w) for w in weapons) if weapons else '')
+            + ('outfits = %s\n' % ' '.join(outfits) if outfits else ''))
 
 
 def read_ini(path):
@@ -321,7 +325,7 @@ def target_of(folder, d):
     return real
 
 
-def write(folder, d, files, slot, chr_tones=0, voice_extra=(), weapons=()):
+def write(folder, d, files, slot, chr_tones=0, voice_extra=(), weapons=(), outfits=()):
     """Writes the pack <folder>/<code>/ from files {suffix or file name: bytes} (a suffix starts with '.': the file
     is <code><suffix>); returns its path. The pack is made whole in a hidden folder beside its place first
     (.<code>.part, character.ini last), which then takes the place of the fighter's earlier pack: that one goes
@@ -334,7 +338,7 @@ def write(folder, d, files, slot, chr_tones=0, voice_extra=(), weapons=()):
     part, old = _working(real)
     out = {(d.CODE + name if name.startswith('.') else name): data for name, data in files.items()}
     out.pop('character.ini', None)
-    out['character.ini'] = character_ini(d, slot, chr_tones, voice_extra, weapons).encode('utf-8')    # (the last)
+    out['character.ini'] = character_ini(d, slot, chr_tones, voice_extra, weapons, outfits).encode('utf-8')
     os.makedirs(os.path.dirname(real), exist_ok=True)
     for path in (part, old):                        # (a killed write's, or one that could not be deleted)
         try:

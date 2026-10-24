@@ -8,7 +8,7 @@ import time
 from . import InputError, pack, shared
 from .characters import CHARACTERS, definition
 from .convert import art, chains, effects as fx, idmaps, itemdb, model, movelist, moveset, particles, tagsystem, \
-    tiger, voice, weapons
+    tiger, voice, weapons, outfits
 from .tekken7 import tkmvst
 from .tekken7.autodump import FILES
 from .tekken7.pak import EncryptedError, Paks, pak_names
@@ -255,8 +255,13 @@ def _run(name, tekken7, movesets, game, out, log, make_shared, files):
         files['.mop'] = mop
     if palettes:
         files['colours.json'] = json.dumps({str(nn): v for nn, v in sorted(palettes.items())}).encode('utf-8')
+    outfit_codes = []
+    if getattr(d, 'PRESETS', ()):
+        step('preset outfits: complete bodies for the in-game costume chooser')
+        files.update(outfits.build(paks, archives, rpx, d, slot, xml, log=log, reference_bon=bon))
+        outfit_codes = outfits.codes(d)
     target = pack.write(out, d, files, slot, chr_tones=chr_tones, voice_extra=voice_extra,
-                        weapons=weapons.of_skeleton(bone.read(bon), getattr(d, 'WEAPONS', ())))
+                        weapons=weapons.of_skeleton(bone.read(bon), getattr(d, 'WEAPONS', ())), outfits=outfit_codes)
     step('wrote %s' % target)
 
     if make_shared:

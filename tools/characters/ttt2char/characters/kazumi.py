@@ -10,6 +10,18 @@ TEKKEN7_CODE = 'kzm'          # her code in Tekken 7's files (AkBankVoiceKZM.bnk
 CODE = 'kzm'                  # her three-letter code in the pack (not a code TTT2 already has)
 SEX = 'female'
 
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c2', 'Default alternate'),
+    ('dancer', 'Dancer'),
+    ('dancer_silver', 'Dancer silver'),
+    ('dougi', 'Dougi'),
+    ('lycoris', 'Lycoris'),
+    ('lycoris_c1', 'Lycoris alternate'),
+    ('taisyo_roman', 'Taisho Roman'),
+)
+
 # The donor: a TTT2 fighter with a similar body and style. Its skeleton is the base of hers, its materials are the
 # templates of hers, its moveset gives the generic and tag moves, and its voice and effects are used for her.
 DONOR = 'jun'                 # Jun Kazama: the 139-bone female skeleton

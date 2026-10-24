@@ -555,7 +555,9 @@ def convert(paks, archives, d, slot=0, log=print):
     (shared.py puts them in the colour grid)."""
     t7 = d.TEKKEN7
     follow = getattr(d, 'DEPENDENCY_ITEMS', False)     # (a definition's: items worn with others, Noctis's trousers)
-    items = costume_items(paks, t7['costume'], follow)
+    items = getattr(d, 'PRESET_ITEMS', None)
+    if items is None:
+        items = costume_items(paks, t7['costume'], follow)
     extra = dependency_parts(items, t7['parts']) if follow else []
     for tag, path in extra:
         log('  %s: worn with the costume (an item another depends on)' % path.split('/')[-1])

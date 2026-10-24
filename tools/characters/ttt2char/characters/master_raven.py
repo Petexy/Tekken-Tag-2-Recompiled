@@ -11,6 +11,17 @@ TEKKEN7_CODE = 'frv'
 CODE = 'frv'
 SEX = 'female'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('pantsuit', 'Pantsuit'),
+    ('pantsuit_c1', 'Pantsuit c1'),
+    ('spec_f_silver', 'Spec f silver'),
+    ('special_forces', 'Special forces'),
+)
+
 DONOR = 'jun'                 # Jun Kazama: the 139-bone female skeleton
 DONOR_ROW = 42
 

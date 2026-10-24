@@ -11,6 +11,20 @@ TEKKEN7_CODE = 'mut'
 CODE = 'mut'
 SEX = 'female'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('1p_shirt_off', '1p shirt off'),
+    ('hoodie_marine', 'Hoodie marine'),
+    ('marine', 'Marine'),
+    ('monosuit', 'Monosuit'),
+    ('monosuit_silver', 'Monosuit silver'),
+    ('riders', 'Riders'),
+    ('riders_c2', 'Riders c2'),
+)
+
 DONOR = 'jun'                 # Jun Kazama: the 139-bone female skeleton
 DONOR_ROW = 42
 

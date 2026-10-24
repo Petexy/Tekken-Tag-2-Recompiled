@@ -151,3 +151,10 @@ if(Python3_Interpreter_FOUND)
         message(STATUS "character_import_test disabled: needs Python 3 with numpy and Pillow")
     endif()
 endif()
+
+# Outfit namespace validation and loader/menu state transitions, without game assets.
+add_executable(outfit_menu_test outfit_menu_test.cpp)
+target_include_directories(outfit_menu_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/src)
+target_compile_features(outfit_menu_test PRIVATE cxx_std_20)
+target_compile_options(outfit_menu_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME outfit_menu_test COMMAND outfit_menu_test)

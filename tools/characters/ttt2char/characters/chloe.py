@@ -10,6 +10,20 @@ TEKKEN7_CODE = 'dnc'          # her code in Tekken 7's files (AkBankVoiceDNC.bnk
 CODE = 'dnc'                  # her three-letter code in the pack (not a code TTT2 already has)
 SEX = 'female'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('1p_jacket_off', '1p jacket off'),
+    ('jack_o', 'Jack o'),
+    ('jack_o_c1', 'Jack o c1'),
+    ('mini_china', 'Mini china'),
+    ('punks', 'Punks'),
+    ('punks_silver', 'Punks silver'),
+    ('star', 'Star'),
+)
+
 DONOR = 'jun'                 # Jun Kazama: the 139-bone female skeleton
 DONOR_ROW = 42                # Jun's motion row (data005 / data006 entry)
 

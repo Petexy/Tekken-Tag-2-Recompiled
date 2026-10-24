@@ -11,6 +11,19 @@ TEKKEN7_CODE = 'ita'
 CODE = 'ita'
 SEX = 'male'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('belts', 'Belts'),
+    ('belts_silver', 'Belts silver'),
+    ('hillbilly', 'Hillbilly'),
+    ('hillbilly_c1', 'Hillbilly c1'),
+    ('pat_shirt', 'Pat shirt'),
+    ('scarf_suit', 'Scarf suit'),
+)
+
 DONOR = 'lar'                 # Lars Alexandersson: a slim male skeleton
 DONOR_ROW = 38
 

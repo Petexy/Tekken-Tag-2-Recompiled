@@ -11,6 +11,19 @@ TEKKEN7_CODE = 'arb'
 CODE = 'arb'
 SEX = 'male'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c2', '1p c2'),
+    ('casual', 'Casual'),
+    ('jiujitsu', 'Jiujitsu'),
+    ('kandoora', 'Kandoora'),
+    ('kandoora_c2', 'Kandoora c2'),
+    ('shiny_s_silver', 'Shiny s silver'),
+    ('shiny_suit', 'Shiny suit'),
+)
+
 DONOR = 'lar'                 # Lars Alexandersson: a slim male skeleton
 DONOR_ROW = 38
 

@@ -12,6 +12,17 @@ TEKKEN7_CODE = 'nsb'
 CODE = 'nsb'
 SEX = 'male'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('black_suit', 'Black suit'),
+    ('black_suit_silver', 'Black suit silver'),
+    ('monkfighter', 'Monkfighter'),
+    ('monkfighter_c1', 'Monkfighter c1'),
+)
+
 DONOR = 'lar'                 # Lars Alexandersson: a slim male skeleton
 DONOR_ROW = 38
 

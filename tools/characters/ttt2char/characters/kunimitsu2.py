@@ -11,6 +11,22 @@ TEKKEN7_CODE = 'knm'
 CODE = 'kmi'
 SEX = 'female'
 
+# Ordered built-in Tekken 7 preset sets for the native costume chooser.
+PRESETS = (
+    ('DefaultCos1P', 'Default'),
+    ('DefaultCos2P', 'Default 2P'),
+    ('1p_c1', '1p c1'),
+    ('1p_old', '1p old'),
+    ('Firefox', 'Firefox'),
+    ('Firefox_silver', 'Firefox silver'),
+    ('hoodie', 'Hoodie'),
+    ('hoodie_c1', 'Hoodie c1'),
+    ('hoodie_off', 'Hoodie off'),
+)
+
+# T7 supplies no separate slot picture for the hood-down variant.
+PRESET_PREVIEWS = {'hoodie_off': 'HOODIE'}
+
 DONOR = 'jun'                 # Jun Kazama: the 139-bone female skeleton
 DONOR_ROW = 42
 
